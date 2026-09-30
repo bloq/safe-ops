@@ -1,0 +1,4 @@
+{
+  "main": "../dist/hardhat/index.cjs",
+  "types": "../dist/hardhat/index.d.cts"
+}
