@@ -1,54 +1,77 @@
 # @bloq/safe-ops
 
-Queue owner transactions for Safe multisigs, export them as Safe Transaction Builder files, and rehearse them on a fork exactly as the Safe will execute them.
+Stage owner transactions for Safe multisigs as Safe Transaction Builder files, rehearse those files on a fork exactly as the Safe will execute them, and propose them to the Safe Transaction Service.
 
-## Usage
-
-```ts
-import { SafeBatch } from "@bloq/safe-ops";
-import { flushSafeBatch, queueIfUnknownSigner } from "@bloq/safe-ops/hardhat";
-
-const batch = new SafeBatch();
-
-// Runs directly when hardhat-deploy can sign for `owner`; otherwise queues the call under `owner`.
-await queueIfUnknownSigner(hre, batch, () => hre.deployments.execute("Vault", { from: owner }, "setFee", 100));
-
-// One Transaction Builder file per Safe in <project root>/safe-batches/<network>/.
-// On a local Hardhat or anvil node the files are read back and executed through the Safe.
-await flushSafeBatch(hre, batch, { name: "Set fees" });
-```
-
-Import the files in the Safe UI with the Transaction Builder app (Apps → Transaction Builder → drag the file in).
-
-- **Duplicates:** `SafeBatch.add` drops a call identical to the latest call already queued for the same contract and returns `false` (`queueIfUnknownSigner` also logs a warning). Deploy scripts that check on-chain state can't see calls that are only queued, so two scripts can queue the same call. `x.update(1), x.update(2), x.update(1)` keeps all three. A deliberate repeat of a call that isn't idempotent, such as a second `harvest()`, needs `{ allowDuplicate: true }`. A duplicate with another call to the same contract in between is kept, and reverts if the contract rejects repeats; the rehearsal catches that.
-- **Local or live** is decided by the node (`web3_clientVersion` reports Hardhat or anvil), not the network name.
-  - **Live:** file names get a timestamp, so repeated runs under the same batch name don't collide. An existing file is never replaced, and a flush that fails partway removes what it wrote.
-  - **Local:** files are marked `FORK REHEARSAL, DO NOT SIGN` in their name (the Safe UI shows it; the Transaction Builder ignores a file's chain and Safe on import). If a rehearsal fails, the flush removes every file it wrote.
-- **Targets must have code:** a call with calldata to an address without code does nothing on chain, so a wrong-chain address or a typo would pass silently. The flush and the rehearsal refuse it unless `allowCallsWithoutCode` is set.
-- **Impersonated Safes:** when the node impersonates a Safe (hardhat-deploy's `autoImpersonate`, on by default on `hardhat` and often set on `localhost`, or an impersonation you made on the node), its calls run directly and nothing is queued. `queueIfUnknownSigner` warns when that happens. Set `HARDHAT_DEPLOY_NO_IMPERSONATION=1` (or `autoImpersonate: false`), and don't impersonate the Safe itself.
-- **Calls that depend on each other:** hardhat-deploy estimates gas for each call from the Safe before handing it over, so a call that only works after an earlier queued call (such as a setter after an upgrade) fails there. Queue those with `batch.add(safe, call)` instead.
-- **Hardhat forks:** in-process forks answer calls at the fork block with the remote chain id; `executeOnFork` mines one local block first, so the Safe's hash matches execution.
-
-### Rehearse the exact file you hand to signers
-
-A rehearsal on a local node runs the fork's own file. To check the file written on the live network, run it on a fresh anvil fork of that chain (anvil keeps the chain id, so the file's `chainId` check passes):
+## Usage with hardhat-deploy
 
 ```ts
-import { executeBatchFileOnFork } from "@bloq/safe-ops/hardhat";
+import { proposeStagedSafeBatches, stageSafeTx } from "@bloq/safe-ops/hardhat";
 
-// anvil --fork-url <rpc of the file's chain>
-await executeBatchFileOnFork(provider, "safe-batches/mainnet/set-fees-1-0x….json");
+// In a deploy script: runs directly when hardhat-deploy can sign for `owner`, otherwise stages it for the Safe.
+await stageSafeTx(hre, () => hre.deployments.execute("Vault", { from: owner }, "setFee", 100));
+
+// Or, if the script already calls catchUnknownSigner itself:
+const unsigned = await hre.deployments.catchUnknownSigner(execute(/* ... */));
+await stageSafeTx(hre, unsigned);
+
+// In the last deploy script (runAtTheEnd): propose what was staged, or rehearse it on a fork.
+const func: DeployFunction = async hre => {
+  await proposeStagedSafeBatches(hre);
+};
 ```
 
-From a Hardhat script, pass `nodeProvider(hre)` as the provider. On a network with `accounts` (for example keys from `.env`), Hardhat's own provider signs every transaction locally and rejects impersonated owners (HH103). `nodeProvider` talks to the node's URL directly, and `flushSafeBatch` uses it for its own rehearsals.
+**Staging.** Each run stages into one Transaction Builder file per Safe, written after every call, in `safe-batches/<network>/<timestamp>-<safe>.json` (e.g. `20261001T153000Z-0xd1de3f.json`). The timestamp is the run's first staged call, so a long run is still one file. Inspect a file, or import it in the Safe UI (Apps → Transaction Builder), but never both import it and propose it.
 
-The rehearsal runs at the Safe's current nonce and does not apply transactions already queued in the Safe Transaction Service, so execute or reject those first if the batch depends on them.
+**Proposing** (`proposeStagedSafeBatches`) handles this run's files, or every staged file for the network when the run staged nothing (e.g. a later run of just the last script); older files are left for later and named in the log. A file staged on a fork is never proposed. Each file is checked against its Safe first:
 
-Core helpers work with any EIP-1193 provider:
+| File                                                                      | Result                                                                                                        |
+| ------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------- |
+| Nothing pending or executed shares its calls                              | Proposed exactly as written, after the pending proposals; file deleted                                        |
+| One pending proposal makes exactly its calls                              | Not proposed again; file deleted (kept if that nonce has competing proposals)                                 |
+| An execution since staging made exactly its calls (including a UI import) | Not proposed; file deleted                                                                                    |
+| Proposals share some of its calls                                         | Not proposed; file kept. Wait for those to execute or reject them, then rerun the deploy, or discard the file |
 
-- `classifyAccount` / `routeOwner`: EOA, EIP-7702 account, Safe or other contract, and whether a caller can act for an owner. A Safe is a proxy whose slot 0 holds an official Safe singleton (from safe-deployments); other contracts are never called, and a failed read on a real Safe throws.
-- `createBatchFile` / `validateChecksum`: Transaction Builder files with the Safe UI's checksum.
-- `executeOnFork`: approve with `threshold` impersonated owners, then `execTransaction`; batches go through the verified MultiSendCallOnly for the Safe's version (1.3.0 for older Safes), so they are atomic. It only runs on a local Hardhat or anvil node, and it leaves the owners impersonated.
+It also warns when something executed since staging changed the file's contracts without sharing its calls, so a rerun can pick that up.
+
+**Confirmation.** Files staged by the same deploy run are proposed without asking: running the deploy is the decision. Anything else (explicit files, or older staged files when the run staged nothing) is first shown as a plan, the same as `safe:list`, followed by `Propose N file(s) and delete M? [y/N]`. Without a terminal (CI, piped output) it refuses unless `yes` is passed (`--yes` for the task). Each file is checked again right before it is proposed, in case the plan went stale. Only the files the plan counted are acted on. A refused or failed file (fork file, edited, wrong chain, service error) doesn't stop other Safes' files, but holds that Safe's later files, which would otherwise take its nonce or jump ahead of it; the run fails at the end, naming each file and why.
+
+**On a local node** (Hardhat or Anvil by `web3_clientVersion`), or a network named `hardhat` or `localhost`, nothing is ever proposed: the files are rehearsed through the real Safe instead, and kept. Local files are named `<safe>.json`, replaced by each run, and marked `FORK REHEARSAL, DO NOT SIGN`; a fork run rehearses only what it staged itself.
+
+- **Proposer:** defaults to Hardhat's `deployer` account, signing through Hardhat's provider. Pass `signer` for another one: any object with `address` and `signMessage({ message: { raw } })`, such as a viem account of any version, or an ethers wallet wrapped as `{ address: w.address, signMessage: ({ message }) => w.signMessage(getBytes(message.raw)) }` (ethers v6; v5 uses `utils.arrayify`). It must be an owner or a proposer of the Safe (owners add proposers in the Safe UI settings). The signature is checked against that address before anything is posted.
+- **Service:** looked up per chain from Safe's config service; pass `txServiceUrl` for another one. Either way it must report the node's chain. api.safe.global needs an `apiKey` (developer.safe.global). Requests time out after 30 seconds; a proposal that timed out may still have landed, and the next run finds it pending.
+- **Duplicates while staging:** a call identical to the latest call staged for the same contract is dropped with a warning, since deploy scripts check executed state and can't see staged calls. `x.update(1), x.update(2), x.update(1)` keeps all three. A deliberate repeat, such as a second `harvest()`, needs `{ allowDuplicate: true }`.
+- **Targets must have code:** calldata to an address without code does nothing on chain, so proposals and rehearsals refuse it unless `allowCallsWithoutCode` is set.
+- **Impersonated Safes:** when the node impersonates a Safe (hardhat-deploy's `autoImpersonate`, or an impersonation on the node), its calls run directly and nothing is staged; `stageSafeTx` warns. Set `HARDHAT_DEPLOY_NO_IMPERSONATION=1` (or `autoImpersonate: false`).
+- **Calls that depend on each other:** hardhat-deploy estimates gas for each call from the Safe first, so a call that only works after an earlier staged call (a setter after an upgrade) fails there. Stage those as `stageSafeTx(hre, { from: safe, to, data })`.
+
+### Tasks (optional)
+
+```ts
+// hardhat.config.ts
+import { registerSafeTasks } from "@bloq/safe-ops/hardhat";
+registerSafeTasks(task);
+```
+
+```sh
+npx hardhat safe:list --network mainnet                      # and what safe:propose would do with each
+npx hardhat safe:rehearse --network hardhat --from mainnet   # forks mainnet in-process, runs the exact files
+npx hardhat safe:propose --network mainnet [--file …] [--yes]   # shows the plan, asks before acting
+npx hardhat safe:discard --network mainnet --file …
+```
+
+`safe:list` on a live network runs the same status check as `safe:propose` and says what would happen to each file (proposed at which nonce, deleted as pending or executed, or kept as partial), without doing it. `registerSafeTasks(task, { apiKey, txServiceUrl, signer })` sets the service and proposer for the tasks (`apiKey` defaults to `SAFE_API_KEY`). `safe:rehearse` resets the in-process Hardhat network (it refuses any other) to a fork of `--from`'s URL, and checks each file is for that chain. Hardhat can't fork every chain (Hemi, for one); use Anvil and `rehearseSafeBatch` there. The rehearsal runs at the Safe's current nonce without the proposals already pending, so execute or reject those first if the batch depends on them.
+
+`nodeProvider(hre)` is the node itself for an HTTP network: on a network with `accounts` (keys from `.env`), Hardhat's own provider signs locally and rejects impersonated owners (HH103). Rehearsals use it.
+
+## Core, without Hardhat
+
+Everything takes an EIP-1193 provider and plain data; nothing reads files.
+
+- `createSafeBatch`, `validateSafeBatch`, `safeBatchCalls`: Transaction Builder files with the Safe UI's checksum.
+- `rehearseSafeBatch(provider, batch)`: runs a batch through its Safe on a local Hardhat or Anvil fork. `executeOnFork(provider, safe, calls)` does the same for raw calls: `threshold` impersonated owners approve, then `execTransaction`; batches go through the verified MultiSendCallOnly for the Safe's version (1.3.0 for older Safes), so they are atomic.
+- `resolveTxService`, `readSafeQueue`, `safeBatchStatus`, `proposeSafeBatch(provider, service, signer, batch)`: the checks and proposal described above.
+- `decodeMultiSendCall`: the calls inside a `multiSend(bytes)` payload, e.g. a batch's data copied from the Safe UI.
+- `classifyAccount`, `readSafe`, `routeOwner`: EOA, EIP-7702 account, Safe or other contract, and whether a caller can act for an owner. A Safe is a proxy whose slot 0 holds an official Safe singleton (from safe-deployments); other contracts are never called. `isProposer` plugs into `routeOwner`: `routeOwner(provider, owner, caller, { isProposer: (safe, a) => isProposer(service, safe, a) })`.
 
 ## Development
 

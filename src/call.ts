@@ -12,3 +12,7 @@ export function normalizeCall(call: SafeCall): Required<SafeCall> {
   if (value < 0n) throw new Error(`Call to ${call.to} has a negative value ${value}`);
   return { to: getAddress(call.to), data: call.data, value };
 }
+
+export function sameCall(a: Required<SafeCall>, b: Required<SafeCall>): boolean {
+  return a.to === b.to && a.data.toLowerCase() === b.data.toLowerCase() && a.value === b.value;
+}

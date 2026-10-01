@@ -5,7 +5,7 @@ import type { SafeCall } from "./types.js";
 // Schema and checksum follow safe-wallet-monorepo apps/tx-builder (typings/models.ts, lib/checksum.ts).
 export const TX_BUILDER_VERSION = "2.1.0";
 
-export interface BatchFileMeta {
+export interface SafeBatchMeta {
   name: string;
   description?: string;
   txBuilderVersion?: string;
@@ -23,15 +23,15 @@ export interface BatchTransaction {
   contractInputsValues?: Record<string, string>;
 }
 
-export interface BatchFile {
+export interface SafeBatch {
   version: string;
   chainId: string;
   createdAt: number;
-  meta: BatchFileMeta;
+  meta: SafeBatchMeta;
   transactions: BatchTransaction[];
 }
 
-export interface CreateBatchFileOptions {
+export interface CreateSafeBatchOptions {
   chainId: bigint | number;
   safe: Address;
   calls: readonly SafeCall[];
@@ -40,8 +40,8 @@ export interface CreateBatchFileOptions {
   createdAt?: number;
 }
 
-export function createBatchFile(options: CreateBatchFileOptions): BatchFile {
-  const meta: BatchFileMeta = {
+export function createSafeBatch(options: CreateSafeBatchOptions): SafeBatch {
+  const meta: SafeBatchMeta = {
     name: options.name,
     txBuilderVersion: TX_BUILDER_VERSION,
     createdFromSafeAddress: getAddress(options.safe),
@@ -57,23 +57,23 @@ export function createBatchFile(options: CreateBatchFileOptions): BatchFile {
   });
 }
 
-export function addChecksum(file: BatchFile): BatchFile {
+export function addChecksum(file: SafeBatch): SafeBatch {
   return { ...file, meta: { ...file.meta, checksum: calculateChecksum(file) } };
 }
 
-export function validateChecksum(file: BatchFile): boolean {
+export function validateSafeBatch(file: SafeBatch): boolean {
   return file.meta.checksum === calculateChecksum(file);
 }
 
-export function calculateChecksum(file: BatchFile): Hex {
+export function calculateChecksum(file: SafeBatch): Hex {
   // Hash the file as it will be written: JSON drops `undefined` keys, which `serialize` would hash as null.
-  const written = JSON.parse(JSON.stringify(file)) as BatchFile;
+  const written = JSON.parse(JSON.stringify(file)) as SafeBatch;
   const { checksum: _checksum, ...meta } = written.meta;
   return keccak256(stringToHex(serialize({ ...written, meta: { ...meta, name: null } })));
 }
 
-/** Calls in a batch file. Only raw `data` entries are supported, which is what `createBatchFile` writes. */
-export function batchFileCalls(file: BatchFile): SafeCall[] {
+/** Calls in a batch file. Only raw `data` entries are supported, which is what `createSafeBatch` writes. */
+export function safeBatchCalls(file: SafeBatch): SafeCall[] {
   return file.transactions.map((tx, i) => {
     const data = tx.data ?? (tx.contractMethod === undefined || tx.contractMethod === null ? "0x" : undefined);
     if (!data || !isHex(data))
@@ -93,4 +93,11 @@ function serialize(value: unknown): string {
     return `{${JSON.stringify(keys, replacer)}${keys.map(k => `${serialize(record[k])},`).join("")}}`;
   }
   return JSON.stringify(value, replacer);
+}
+
+/** The Safe a batch was made for. */
+export function batchSafe(batch: SafeBatch): Address {
+  const safe = batch.meta.createdFromSafeAddress;
+  if (!safe) throw new Error("Batch does not name its Safe (meta.createdFromSafeAddress)");
+  return getAddress(safe);
 }

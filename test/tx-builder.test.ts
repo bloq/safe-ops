@@ -1,16 +1,9 @@
 import { describe, expect, it } from "vitest";
-import {
-  addChecksum,
-  batchFileCalls,
-  calculateChecksum,
-  createBatchFile,
-  validateChecksum,
-  type BatchFile,
-  type SafeCall,
-} from "../src/index.js";
+import { createSafeBatch, safeBatchCalls, validateSafeBatch, type SafeBatch, type SafeCall } from "../src/index.js";
+import { addChecksum, calculateChecksum } from "../src/tx-builder.js";
 
 // Fixture and expected checksum from safe-wallet-monorepo apps/tx-builder/src/lib/checksum.test.ts
-const upstream: BatchFile = {
+const upstream: SafeBatch = {
   version: "1.0",
   chainId: "4",
   createdAt: 1646321521061,
@@ -60,8 +53,8 @@ describe("checksum", () => {
   });
 
   it("ignores key order", () => {
-    const reversed = Object.fromEntries(Object.entries(upstream).reverse()) as unknown as BatchFile;
-    reversed.meta = Object.fromEntries(Object.entries(upstream.meta).reverse()) as unknown as BatchFile["meta"];
+    const reversed = Object.fromEntries(Object.entries(upstream).reverse()) as unknown as SafeBatch;
+    reversed.meta = Object.fromEntries(Object.entries(upstream.meta).reverse()) as unknown as SafeBatch["meta"];
     expect(calculateChecksum(reversed)).toBe(UPSTREAM_CHECKSUM);
   });
 
@@ -76,38 +69,38 @@ describe("checksum", () => {
 
   it("validates an added checksum and rejects a tampered file", () => {
     const file = addChecksum(upstream);
-    expect(validateChecksum(file)).toBe(true);
-    expect(validateChecksum({ ...file, chainId: "1" })).toBe(false);
+    expect(validateSafeBatch(file)).toBe(true);
+    expect(validateSafeBatch({ ...file, chainId: "1" })).toBe(false);
   });
 });
 
-describe("createBatchFile", () => {
+describe("createSafeBatch", () => {
   const calls: SafeCall[] = [
     { to: TARGET, data: "0x12345678" },
     { to: TARGET, data: "0xabcdef01", value: 5n },
   ];
 
   it("writes a checksummed file that names its Safe", () => {
-    const file = createBatchFile({ chainId: 1n, safe: SAFE, calls, name: "upgrade", createdAt: 1 });
+    const file = createSafeBatch({ chainId: 1n, safe: SAFE, calls, name: "upgrade", createdAt: 1 });
     expect(file).toMatchObject({ version: "1.0", chainId: "1", createdAt: 1 });
     expect(file.meta.createdFromSafeAddress).toBe(SAFE);
     expect(file.transactions).toEqual([
       { to: TARGET, value: "0", data: "0x12345678" },
       { to: TARGET, value: "5", data: "0xabcdef01" },
     ]);
-    expect(validateChecksum(file)).toBe(true);
+    expect(validateSafeBatch(file)).toBe(true);
   });
 
   it("round-trips its calls", () => {
-    const file = createBatchFile({ chainId: 1, safe: SAFE, calls, name: "upgrade" });
-    expect(batchFileCalls(file)).toEqual([
+    const file = createSafeBatch({ chainId: 1, safe: SAFE, calls, name: "upgrade" });
+    expect(safeBatchCalls(file)).toEqual([
       { to: TARGET, data: "0x12345678", value: 0n },
       { to: TARGET, data: "0xabcdef01", value: 5n },
     ]);
   });
 
   it("refuses contractMethod entries when reading calls", () => {
-    expect(() => batchFileCalls(upstream)).toThrow(/Transaction 0 has no raw data/);
+    expect(() => safeBatchCalls(upstream)).toThrow(/Transaction 0 has no raw data/);
   });
 });
 
@@ -115,16 +108,16 @@ describe("checksum of written files", () => {
   it("survives a JSON round trip when optional fields are undefined", () => {
     const file = addChecksum({
       ...upstream,
-      meta: { ...upstream.meta, description: undefined } as unknown as BatchFile["meta"],
+      meta: { ...upstream.meta, description: undefined } as unknown as SafeBatch["meta"],
     });
-    expect(validateChecksum(JSON.parse(JSON.stringify(file)) as BatchFile)).toBe(true);
+    expect(validateSafeBatch(JSON.parse(JSON.stringify(file)) as SafeBatch)).toBe(true);
   });
 
   it("rejects values that are not plain decimal integers", () => {
-    const file = createBatchFile({ chainId: 1, safe: SAFE, calls: [{ to: TARGET, data: "0x" }], name: "x" });
+    const file = createSafeBatch({ chainId: 1, safe: SAFE, calls: [{ to: TARGET, data: "0x" }], name: "x" });
     for (const value of ["", " 5", "-5", "0x10", "1e3"]) {
       const tx = { ...file.transactions[0], to: TARGET, value };
-      expect(() => batchFileCalls({ ...file, transactions: [tx] })).toThrow(/invalid value/);
+      expect(() => safeBatchCalls({ ...file, transactions: [tx] })).toThrow(/invalid value/);
     }
   });
 });
@@ -132,6 +125,6 @@ describe("checksum of written files", () => {
 describe("files from the Safe UI", () => {
   it("reads an ETH transfer with null data as empty calldata", () => {
     const file = { ...upstream, transactions: [{ to: TARGET, value: "5", data: null }] };
-    expect(batchFileCalls(file)).toEqual([{ to: TARGET, data: "0x", value: 5n }]);
+    expect(safeBatchCalls(file)).toEqual([{ to: TARGET, data: "0x", value: 5n }]);
   });
 });

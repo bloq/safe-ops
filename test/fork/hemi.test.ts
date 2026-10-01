@@ -1,6 +1,7 @@
 import { encodeFunctionData, parseAbi, type PublicClient } from "viem";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { classifyAccount, executeOnFork, publicClientFor, type SafeCall } from "../../src/index.js";
+import { classifyAccount, executeOnFork, type SafeCall } from "../../src/index.js";
+import { publicClientFor } from "../../src/client.js";
 import { startAnvil, type Anvil } from "./anvil.js";
 
 const HEMI_FORK_URL = process.env.HEMI_FORK_URL;
@@ -27,7 +28,7 @@ describe.skipIf(!HEMI_FORK_URL)("hemi fork", () => {
 
   it("executes a batch through MultiSendCallOnly on Hemi", async () => {
     expect(await client.readContract({ address: VAULT, abi: vaultAbi, functionName: "owner" })).toBe(SAFE);
-    expect((await classifyAccount(client, SAFE)).kind).toBe("safe");
+    expect((await classifyAccount(anvil.provider, SAFE)).kind).toBe("safe");
 
     const call = (limit: bigint): SafeCall => ({
       to: VAULT,

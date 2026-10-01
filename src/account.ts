@@ -1,6 +1,8 @@
 import { getSafeL2SingletonDeployments, getSafeSingletonDeployments } from "@safe-global/safe-deployments";
-import { getAddress, isAddressEqual, size, sliceHex, type Address, type PublicClient } from "viem";
+import { getAddress, isAddressEqual, size, sliceHex, type Address } from "viem";
 import { safeAbi } from "./abi.js";
+import { publicClientFor } from "./client.js";
+import type { Eip1193Provider } from "./types.js";
 
 const EIP7702_PREFIX = "0xef0100";
 
@@ -18,14 +20,14 @@ export type AccountInfo =
   | { kind: "safe"; address: Address; safe: SafeInfo }
   | { kind: "contract"; address: Address };
 
-export async function classifyAccount(client: PublicClient, account: Address): Promise<AccountInfo> {
+export async function classifyAccount(provider: Eip1193Provider, account: Address): Promise<AccountInfo> {
   const address = getAddress(account);
-  const code = await client.getCode({ address });
+  const code = await publicClientFor(provider).getCode({ address });
   if (!code || code === "0x") return { kind: "eoa", address };
   if (code.startsWith(EIP7702_PREFIX) && code.length === 48) {
     return { kind: "eip7702", address, delegate: getAddress(sliceHex(code, 3)) };
   }
-  const safe = await readSafe(client, address);
+  const safe = await readSafe(provider, address);
   return safe ? { kind: "safe", address, safe } : { kind: "contract", address };
 }
 
@@ -34,7 +36,8 @@ export async function classifyAccount(client: PublicClient, account: Address): P
  * L1 and L2). Anything else is not a Safe, without calling it, so no RPC error can be mistaken for a "no". Once the
  * singleton matches, a failed read throws. An uninitialized proxy (no threshold or owners) is not a Safe.
  */
-export async function readSafe(client: PublicClient, address: Address): Promise<SafeInfo | undefined> {
+export async function readSafe(provider: Eip1193Provider, address: Address): Promise<SafeInfo | undefined> {
+  const client = publicClientFor(provider);
   const slot0 = await client.getStorageAt({ address, slot: "0x0" });
   if (!slot0 || size(slot0) !== 32) return undefined;
   const singleton = getAddress(sliceHex(slot0, 12));
@@ -70,17 +73,17 @@ export type OwnerRoute =
   | { kind: "skip"; owner: Address; reason: string };
 
 export interface RouteOptions {
-  isDelegate?: (safe: Address, caller: Address) => Promise<boolean>;
+  isProposer?: (safe: Address, caller: Address) => Promise<boolean>;
 }
 
 /** Decides how `caller` can act for `owner`: sign directly, go through the owner's Safe, or not at all. */
 export async function routeOwner(
-  client: PublicClient,
+  provider: Eip1193Provider,
   owner: Address,
   caller: Address,
   options: RouteOptions = {},
 ): Promise<OwnerRoute> {
-  const account = await classifyAccount(client, owner);
+  const account = await classifyAccount(provider, owner);
   const { address } = account;
   const isCaller = isAddressEqual(address, caller);
 
@@ -90,7 +93,7 @@ export async function routeOwner(
       const { safe } = account;
       if (isCaller) return { kind: "skip", owner: address, reason: `Safe ${address} can't sign for itself` };
       if (safe.owners.some(o => isAddressEqual(o, caller))) return { kind: "safe", owner: address, safe };
-      if (await options.isDelegate?.(address, caller)) return { kind: "safe", owner: address, safe };
+      if (await options.isProposer?.(address, caller)) return { kind: "safe", owner: address, safe };
       return { kind: "skip", owner: address, reason: `${caller} is not an owner or delegate of Safe ${address}` };
     }
     case "eoa":

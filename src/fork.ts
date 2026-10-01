@@ -15,8 +15,9 @@ import {
 import { CALL, DELEGATE_CALL, EXECUTION_SUCCESS_TOPIC, safeAbi } from "./abi.js";
 import { readSafe } from "./account.js";
 import { normalizeCall } from "./call.js";
-import { publicClientFor } from "./client.js";
-import { encodeMultiSendCall, resolveMultiSendCallOnly } from "./multisend.js";
+import { assertCallTargetsHaveCode, describeError, localNodeVersion, publicClientFor } from "./client.js";
+import { safeTxFields } from "./multisend.js";
+import { batchSafe, safeBatchCalls, validateSafeBatch, type SafeBatch } from "./tx-builder.js";
 import type { Eip1193Provider, SafeCall } from "./types.js";
 
 export interface ForkExecution {
@@ -54,14 +55,14 @@ export async function executeOnFork(
   // from the one the Safe computes when executing (GS025). One local block moves calls to the fork's own chain id.
   if (/^HardhatNetwork\//i.test(node)) await provider.request({ method: "hardhat_mine", params: ["0x1"] });
   const client = publicClientFor(provider);
-  const info = await readSafe(client, getAddress(safe));
+  const info = await readSafe(provider, getAddress(safe));
   if (!info) throw new Error(`${safe} is not a Safe`);
   // 1.0.0 has no ExecutionSuccess event, so a rehearsal could not tell success from failure.
   if (/^1\.0\./.test(info.version)) throw new Error(`Safe ${info.address} is ${info.version}; 1.0.x is unsupported`);
 
   const normalized = calls.map(normalizeCall);
   if (!options.allowCallsWithoutCode) await assertCallTargetsHaveCode(client, normalized);
-  const [to, value, data, operation] = await safeTxFields(client, info.version, normalized);
+  const [to, value, data, operation] = await safeTxFields(provider, info.version, normalized);
   const nonce = await client.readContract({ address: info.address, abi: safeAbi, functionName: "nonce" });
   const txArgs = [to, value, data, operation, 0n, 0n, 0n, zeroAddress, zeroAddress] as const;
   const safeTxHash = await client.readContract({
@@ -91,6 +92,25 @@ export async function executeOnFork(
   return { safe: info.address, safeTxHash, txHash: receipt.transactionHash, nonce, approvers, to, operation };
 }
 
+export interface RehearseOptions extends ForkOptions {
+  /** Rehearse a batch made for another chain, e.g. a mainnet batch on a Hardhat fork running as 31337. */
+  allowChainMismatch?: boolean;
+}
+
+/** Executes exactly the batch's calls through its Safe on a fork, after checking its checksum and chain. */
+export async function rehearseSafeBatch(
+  provider: Eip1193Provider,
+  batch: SafeBatch,
+  options: RehearseOptions = {},
+): Promise<ForkExecution> {
+  if (!validateSafeBatch(batch)) throw new Error("Batch has an invalid checksum; it was edited after it was written");
+  const chainId = await publicClientFor(provider).getChainId();
+  if (!options.allowChainMismatch && batch.chainId !== String(chainId)) {
+    throw new Error(`Batch is for chain ${batch.chainId}, but the fork runs chain ${chainId}`);
+  }
+  return executeOnFork(provider, batchSafe(batch), safeBatchCalls(batch), options);
+}
+
 interface LogLike {
   address: string;
   topics: readonly (string | undefined)[];
@@ -108,60 +128,10 @@ export function emittedExecutionSuccess(logs: readonly LogLike[], safe: Address,
   );
 }
 
-/** Rejects calldata sent to an address without code: the EVM treats it as a successful no-op. */
-export async function assertCallTargetsHaveCode(client: PublicClient, calls: readonly SafeCall[]): Promise<void> {
-  for (const [i, call] of calls.entries()) {
-    if (call.data === "0x") continue;
-    const code = await client.getCode({ address: call.to });
-    if (!code || code === "0x") {
-      throw new Error(
-        `Call ${i} sends calldata to ${call.to}, which has no code here; pass allowCallsWithoutCode if that is intended`,
-      );
-    }
-  }
-}
-
 /** Ascending by numeric address value, the order `checkSignatures` requires. Locale-independent. */
 export function sortOwners(owners: readonly Address[]): Address[] {
   // Owners are unique, so no two compare equal.
   return [...owners].sort((a, b) => (BigInt(a) < BigInt(b) ? -1 : 1));
-}
-
-/**
- * The client version when `provider` is a local Hardhat or Anvil node, else undefined. Impersonation on a live RPC
- * that happens to support it (e.g. a hosted fork) must never be mistaken for a rehearsal.
- */
-export async function localNodeVersion(provider: Eip1193Provider): Promise<string | undefined> {
-  try {
-    const version = String(await provider.request({ method: "web3_clientVersion" }));
-    return /^(HardhatNetwork|anvil)\//i.test(version) ? version : undefined;
-  } catch {
-    return undefined;
-  }
-}
-
-/** The first and the deepest message in an error's cause chain; the deepest is the node's, with the revert reason. */
-export function describeError(error: unknown): string {
-  const messages: string[] = [];
-  for (let e: unknown = error; typeof e === "object" && e !== null; e = (e as { cause?: unknown }).cause) {
-    const { shortMessage, details, message } = e as Record<string, unknown>;
-    const text = [shortMessage, details, message].find(m => typeof m === "string" && m.length > 0) as
-      string | undefined;
-    if (text && !messages.includes(text)) messages.push(text);
-  }
-  const first = messages[0] ?? String(error);
-  const deepest = messages.at(-1) ?? first;
-  return deepest === first ? first : `${first} (${deepest})`;
-}
-
-async function safeTxFields(
-  client: PublicClient,
-  version: string,
-  calls: readonly Required<SafeCall>[],
-): Promise<readonly [Address, bigint, Hex, typeof CALL | typeof DELEGATE_CALL]> {
-  const [only] = calls;
-  if (calls.length === 1 && only) return [only.to, only.value, only.data, CALL];
-  return [await resolveMultiSendCallOnly(client, version), 0n, encodeMultiSendCall(calls), DELEGATE_CALL];
 }
 
 const MIN_BALANCE = parseEther("1");

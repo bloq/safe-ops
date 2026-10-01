@@ -1,5 +1,5 @@
 import { getAddress, type Address } from "viem";
-import { normalizeCall } from "./call.js";
+import { normalizeCall, sameCall } from "./call.js";
 import type { SafeCall } from "./types.js";
 
 export interface AddOptions {
@@ -12,7 +12,7 @@ export interface AddOptions {
  * contract is dropped: deploy scripts guard on executed state, which queued calls don't change yet, so two
  * scripts can queue the same call. `x.update(1), x.update(2), x.update(1)` keeps all three.
  */
-export class SafeBatch {
+export class CallQueue {
   readonly #groups = new Map<Address, Required<SafeCall>[]>();
 
   /** Returns false when the call was dropped as a duplicate. */
@@ -52,8 +52,4 @@ function latestCallTo(calls: readonly Required<SafeCall>[], to: Address): Requir
     if (call?.to === to) return call;
   }
   return undefined;
-}
-
-function sameCall(a: Required<SafeCall>, b: Required<SafeCall>): boolean {
-  return a.to === b.to && a.data.toLowerCase() === b.data.toLowerCase() && a.value === b.value;
 }

@@ -1,7 +1,8 @@
 import type { Address } from "viem";
 import { describe, expect, it } from "vitest";
 import { EXECUTION_SUCCESS_TOPIC } from "../src/abi.js";
-import { describeError, emittedExecutionSuccess, executeOnFork, sortOwners } from "../src/fork.js";
+import { describeError } from "../src/client.js";
+import { emittedExecutionSuccess, executeOnFork, sortOwners } from "../src/fork.js";
 import type { Eip1193Provider } from "../src/index.js";
 import { safeProvider } from "./safe-mock.js";
 

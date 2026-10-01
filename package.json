@@ -1,6 +1,6 @@
 {
   "name": "@bloq/safe-ops",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "Queue, export, rehearse and propose owner transactions for Safe multisigs",
   "license": "MIT",
   "author": "Rohit Solia <rohit@bloq.com>",

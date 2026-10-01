@@ -1,4 +1,4 @@
-import { mkdtemp, readdir, readFile, writeFile } from "node:fs/promises";
+import { mkdtemp, readdir, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import {
@@ -11,24 +11,19 @@ import {
   type PublicClient,
 } from "viem";
 import { afterAll, beforeAll, beforeEach, afterEach, describe, expect, it } from "vitest";
+import { proposeStagedSafeBatches, stageSafeTx, type HardhatDeployRuntime } from "../../src/hardhat/index.js";
 import {
-  executeBatchFileOnFork,
-  flushSafeBatch,
-  queueIfUnknownSigner,
-  type HardhatDeployRuntime,
-} from "../../src/hardhat/index.js";
-import {
-  addChecksum,
   classifyAccount,
+  createSafeBatch,
   executeOnFork,
-  publicClientFor,
+  rehearseSafeBatch,
   routeOwner,
-  SafeBatch,
-  validateChecksum,
-  type BatchFile,
+  validateSafeBatch,
+  type SafeBatch,
   type Eip1193Provider,
   type SafeCall,
 } from "../../src/index.js";
+import { publicClientFor } from "../../src/client.js";
 import { sortOwners } from "../../src/fork.js";
 import { startAnvil, type Anvil } from "./anvil.js";
 
@@ -82,7 +77,7 @@ describe.skipIf(!FORK_URL)("ethereum fork", () => {
 
   describe("classifyAccount", () => {
     it("reads a Safe's version, threshold, owners and singleton", async () => {
-      const info = await classifyAccount(client, SAFE_141);
+      const info = await classifyAccount(anvil.provider, SAFE_141);
       expect(info.kind).toBe("safe");
       if (info.kind !== "safe") return;
       expect(info.safe.version).toBe("1.4.1");
@@ -92,7 +87,7 @@ describe.skipIf(!FORK_URL)("ethereum fork", () => {
     });
 
     it("detects an EIP-7702 account and its delegate", async () => {
-      expect(await classifyAccount(client, EIP7702_ACCOUNT)).toEqual({
+      expect(await classifyAccount(anvil.provider, EIP7702_ACCOUNT)).toEqual({
         kind: "eip7702",
         address: EIP7702_ACCOUNT,
         delegate: "0x63c0c19a282a1B52b07dD5a65b58948A07DAE32B",
@@ -100,27 +95,27 @@ describe.skipIf(!FORK_URL)("ethereum fork", () => {
     });
 
     it("tells EOAs and non-Safe contracts apart", async () => {
-      expect((await classifyAccount(client, STRANGER)).kind).toBe("eoa");
-      expect((await classifyAccount(client, USDC)).kind).toBe("contract");
+      expect((await classifyAccount(anvil.provider, STRANGER)).kind).toBe("eoa");
+      expect((await classifyAccount(anvil.provider, USDC)).kind).toBe("contract");
     });
   });
 
   describe("routeOwner", () => {
     it("routes owners through the Safe, never lets a Safe or contract act directly, and skips strangers", async () => {
-      const info = await classifyAccount(client, SAFE_141);
+      const info = await classifyAccount(anvil.provider, SAFE_141);
       if (info.kind !== "safe") throw new Error("expected a Safe");
       const signer = info.safe.owners[0] ?? STRANGER;
 
-      expect((await routeOwner(client, SAFE_141, signer)).kind).toBe("safe");
-      expect(await routeOwner(client, SAFE_141, SAFE_141)).toMatchObject({ kind: "skip" });
-      expect(await routeOwner(client, USDC, USDC)).toMatchObject({ kind: "skip" });
-      expect((await routeOwner(client, EIP7702_ACCOUNT, EIP7702_ACCOUNT)).kind).toBe("direct");
-      expect(await routeOwner(client, SAFE_141, STRANGER)).toMatchObject({ kind: "skip" });
-      expect(await routeOwner(client, EIP7702_ACCOUNT, STRANGER)).toMatchObject({ kind: "skip" });
+      expect((await routeOwner(anvil.provider, SAFE_141, signer)).kind).toBe("safe");
+      expect(await routeOwner(anvil.provider, SAFE_141, SAFE_141)).toMatchObject({ kind: "skip" });
+      expect(await routeOwner(anvil.provider, USDC, USDC)).toMatchObject({ kind: "skip" });
+      expect((await routeOwner(anvil.provider, EIP7702_ACCOUNT, EIP7702_ACCOUNT)).kind).toBe("direct");
+      expect(await routeOwner(anvil.provider, SAFE_141, STRANGER)).toMatchObject({ kind: "skip" });
+      expect(await routeOwner(anvil.provider, EIP7702_ACCOUNT, STRANGER)).toMatchObject({ kind: "skip" });
     });
 
-    it("accepts a delegate through the isDelegate hook", async () => {
-      const route = await routeOwner(client, SAFE_141, STRANGER, { isDelegate: () => Promise.resolve(true) });
+    it("accepts a delegate through the isProposer hook", async () => {
+      const route = await routeOwner(anvil.provider, SAFE_141, STRANGER, { isProposer: () => Promise.resolve(true) });
       expect(route.kind).toBe("safe");
     });
   });
@@ -172,7 +167,7 @@ describe.skipIf(!FORK_URL)("ethereum fork", () => {
     });
 
     it("leaves an approver the caller impersonated usable", async () => {
-      const info = await classifyAccount(client, SAFE_141);
+      const info = await classifyAccount(anvil.provider, SAFE_141);
       if (info.kind !== "safe") throw new Error("expected a Safe");
       const approvers = sortOwners(info.safe.owners.slice(0, Number(info.safe.threshold)));
       const owner = approvers[0] ?? STRANGER;
@@ -222,38 +217,30 @@ describe.skipIf(!FORK_URL)("ethereum fork", () => {
   }
 
   describe("hardhat flow", () => {
-    it("queues unsigned txs, writes one Tx Builder file per Safe and rehearses the files", async () => {
-      const hre: HardhatDeployRuntime = {
-        network: { name: "localhost", provider: anvil.provider },
-        deployments: {
-          // Simulates hardhat-deploy failing to sign for `from`.
-          catchUnknownSigner: async action => {
-            const tx = (await (typeof action === "function" ? action() : action)) as SafeCall & { from: Address };
-            return { from: tx.from, to: tx.to, data: tx.data };
-          },
-        },
-      };
-      const unsigned = (from: Address, call: SafeCall) => Promise.resolve({ from, ...call });
-      const batch = new SafeBatch();
-      await queueIfUnknownSigner(hre, batch, unsigned(SAFE_141, setLimit(VAULT_A, 7n)));
-      await queueIfUnknownSigner(hre, batch, unsigned(SAFE_141, setLimit(VAULT_B, 8n)));
-      await queueIfUnknownSigner(hre, batch, unsigned(SAFE_130, setLimit(VAULT_C, 9n)));
+    const runtimeAt = async (provider: Eip1193Provider, config?: object): Promise<HardhatDeployRuntime> => ({
+      network: { name: "localhost", provider, ...(config ? { config } : {}) },
+      config: { paths: { root: await mkdtemp(path.join(tmpdir(), "safe-ops-")) } },
+      deployments: { catchUnknownSigner: () => Promise.resolve(null) },
+    });
+    const unsigned = (from: Address, call: SafeCall) => ({ from, to: call.to, data: call.data });
 
-      const outDir = await mkdtemp(path.join(tmpdir(), "safe-ops-"));
-      const flushed = await flushSafeBatch(hre, batch, { name: "Vault Upgrade 1.3.0", outDir });
+    it("stages one Tx Builder file per Safe and rehearses exactly those files", async () => {
+      const hre = await runtimeAt(anvil.provider);
+      await stageSafeTx(hre, unsigned(SAFE_141, setLimit(VAULT_A, 7n)));
+      await stageSafeTx(hre, unsigned(SAFE_141, setLimit(VAULT_B, 8n)));
+      await stageSafeTx(hre, unsigned(SAFE_130, setLimit(VAULT_C, 9n)));
 
-      expect(flushed.map(f => [f.safe, f.calls])).toEqual([
-        [SAFE_141, 2],
-        [SAFE_130, 1],
+      const results = await proposeStagedSafeBatches(hre);
+      expect(results.map(r => [r.safe, r.execution?.safe, r.removed])).toEqual([
+        [SAFE_141, SAFE_141, false],
+        [SAFE_130, SAFE_130, false],
       ]);
-      for (const entry of flushed) {
-        const file = JSON.parse(await readFile(entry.file, "utf8")) as BatchFile;
-        expect(validateChecksum(file)).toBe(true);
-        expect(file.meta.createdFromSafeAddress).toBe(entry.safe);
-        expect(entry.execution).toBeDefined();
+      for (const { file, safe } of results) {
+        const batch = JSON.parse(await readFile(file, "utf8")) as SafeBatch;
+        expect(validateSafeBatch(batch)).toBe(true);
+        expect(batch.meta.createdFromSafeAddress).toBe(safe);
       }
       expect([await limit(VAULT_A), await limit(VAULT_B), await limit(VAULT_C)]).toEqual([7n, 8n, 9n]);
-      expect(batch.size).toBe(0);
     });
 
     it("rehearses through the node when Hardhat signs with local keys", async () => {
@@ -266,59 +253,32 @@ describe.skipIf(!FORK_URL)("ethereum fork", () => {
       };
       await expect(executeOnFork(localKeys, SAFE_141, [setLimit(VAULT_A, 3n)])).rejects.toThrow(/local keys/);
 
-      const hre: HardhatDeployRuntime = {
-        network: { name: "localhost", provider: localKeys, config: { url: anvil.url } },
-        deployments: { catchUnknownSigner: () => Promise.resolve(null) },
-      };
-      const batch = new SafeBatch();
-      batch.add(SAFE_141, setLimit(VAULT_A, 4n));
-      const outDir = await mkdtemp(path.join(tmpdir(), "safe-ops-"));
-      const [entry] = await flushSafeBatch(hre, batch, { name: "local keys", outDir });
-      expect(entry?.execution).toBeDefined();
+      const hre = await runtimeAt(localKeys, { url: anvil.url });
+      await stageSafeTx(hre, unsigned(SAFE_141, setLimit(VAULT_A, 4n)));
+      const [result] = await proposeStagedSafeBatches(hre);
+      expect(result?.execution).toBeDefined();
       expect(await limit(VAULT_A)).toBe(4n);
     });
 
-    it("leaves no file behind when a later Safe's rehearsal fails", async () => {
-      const hre: HardhatDeployRuntime = {
-        network: { name: "localhost", provider: anvil.provider },
-        deployments: { catchUnknownSigner: () => Promise.resolve(null) },
-      };
-      const batch = new SafeBatch();
-      batch.add(SAFE_141, setLimit(VAULT_A, 5n));
-      batch.add(SAFE_130, {
+    it("fails on a staged call the Safe would revert, keeping the file to inspect", async () => {
+      const hre = await runtimeAt(anvil.provider);
+      await stageSafeTx(hre, {
+        from: SAFE_130,
         to: VAULT_C,
         data: encodeFunctionData({ abi: vaultAbi, functionName: "updatePerformanceFee", args: [10_001n] }),
       });
-      const outDir = await mkdtemp(path.join(tmpdir(), "safe-ops-"));
-      await expect(flushSafeBatch(hre, batch, { name: "two safes", outDir })).rejects.toThrow(/would revert/);
-      expect(await readdir(outDir)).toEqual([]);
-      expect(batch.size).toBe(2);
+      await expect(proposeStagedSafeBatches(hre)).rejects.toThrow(/would revert/);
+      expect(await readdir(path.join(hre.config?.paths.root ?? "", "safe-batches", "localhost"))).toHaveLength(1);
     });
 
-    it("refuses to rehearse a file made for another chain", async () => {
-      const hre: HardhatDeployRuntime = {
-        network: { name: "localhost", provider: anvil.provider },
-        deployments: { catchUnknownSigner: () => Promise.resolve(null) },
-      };
-      const batch = new SafeBatch();
-      batch.add(SAFE_141, setLimit(VAULT_A, 1n));
-      const outDir = await mkdtemp(path.join(tmpdir(), "safe-ops-"));
-      const [entry] = await flushSafeBatch(hre, batch, { name: "chain check", outDir });
-      const file = JSON.parse(await readFile(entry?.file ?? "", "utf8")) as BatchFile;
-      const polygon = addChecksum({ ...file, chainId: "137" });
-      const polygonPath = path.join(outDir, "polygon.json");
-      await writeFile(polygonPath, JSON.stringify(polygon));
-      await expect(executeBatchFileOnFork(anvil.provider, polygonPath)).rejects.toThrow(/is for chain 137/);
+    it("refuses to rehearse a batch made for another chain", async () => {
+      const batch = createSafeBatch({ chainId: 137, safe: SAFE_141, calls: [setLimit(VAULT_A, 1n)], name: "x" });
+      await expect(rehearseSafeBatch(anvil.provider, batch)).rejects.toThrow(/is for chain 137/);
     });
 
-    it("refuses to flush calls queued for an account that is not a Safe", async () => {
-      const hre: HardhatDeployRuntime = {
-        network: { name: "localhost", provider: anvil.provider },
-        deployments: { catchUnknownSigner: () => Promise.resolve(null) },
-      };
-      const batch = new SafeBatch();
-      batch.add(EIP7702_ACCOUNT, setLimit(VAULT_A, 1n));
-      await expect(flushSafeBatch(hre, batch, { name: "bad" })).rejects.toThrow(/is not a Safe/);
+    it("refuses to stage calls for an account that is not a Safe", async () => {
+      const hre = await runtimeAt(anvil.provider);
+      await expect(stageSafeTx(hre, unsigned(EIP7702_ACCOUNT, setLimit(VAULT_A, 1n)))).rejects.toThrow(/is not a Safe/);
     });
   });
 });

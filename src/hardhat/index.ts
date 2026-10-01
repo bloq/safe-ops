@@ -1,18 +1,23 @@
-import { mkdir, readFile, rm, writeFile } from "node:fs/promises";
+import { mkdir, readdir, readFile, rm, writeFile } from "node:fs/promises";
 import path from "node:path";
+import { createInterface } from "node:readline/promises";
 import { getAddress, http, isAddress, isHex, type Address } from "viem";
 import { readSafe } from "../account.js";
-import type { AddOptions, SafeBatch } from "../batch.js";
-import { publicClientFor } from "../client.js";
+import { CallQueue, type AddOptions } from "../batch.js";
+import { describeError, localNodeVersion, publicClientFor } from "../client.js";
+import { rehearseSafeBatch, type ForkExecution } from "../fork.js";
 import {
-  assertCallTargetsHaveCode,
-  executeOnFork,
-  localNodeVersion,
-  type ForkExecution,
-  type ForkOptions,
-} from "../fork.js";
-import { batchFileCalls, createBatchFile, validateChecksum, type BatchFile } from "../tx-builder.js";
-import type { Eip1193Provider } from "../types.js";
+  proposeSafeBatch,
+  resolveTxService,
+  safeBatchStatus,
+  type TxService,
+  type ProposalSigner,
+  type ProposeSafeBatchResult,
+  type TxServiceOptions,
+} from "../propose.js";
+import { batchSafe, createSafeBatch, validateSafeBatch, type SafeBatch } from "../tx-builder.js";
+import { kept, printFile, printFolder, refused, rehearsed, verdict } from "./output.js";
+import type { Eip1193Provider, SafeCall } from "../types.js";
 
 export interface UnknownSignerTx {
   from: string;
@@ -29,29 +34,128 @@ export interface HardhatDeployRuntime {
     // so a real `hre` would not be assignable.
     config?: object;
   };
-  config?: { paths: { root: string } };
+  config?: { paths: { root: string }; networks?: Record<string, object> };
   deployments: {
     catchUnknownSigner(
       action: Promise<unknown> | (() => Promise<unknown>),
       options?: { log?: boolean },
     ): Promise<UnknownSignerTx | null>;
   };
+  getNamedAccounts?(): Promise<Record<string, string>>;
 }
 
 // Shown in the Safe UI and excluded from the checksum; the Transaction Builder ignores chainId and Safe on import.
 const FORK_MARKER = "FORK REHEARSAL, DO NOT SIGN: ";
 
+interface StagingRun {
+  chainId: number;
+  local: boolean;
+  dir: string;
+  createdAt: number;
+  queue: CallQueue;
+  files: Map<Address, string>;
+  /** Staging steps run one at a time, so concurrent calls can't race on a file. */
+  steps: Promise<unknown>;
+}
+
+const runs = new WeakMap<HardhatDeployRuntime, Promise<StagingRun>>();
+
 /**
- * Runs a hardhat-deploy action (`execute` or `rawTx`). If the `from` account can't be signed for, the call is
- * queued on `batch` under that account instead. Returns true when the call is left to the Safe, including when
- * the same call is already queued (see `SafeBatch.add`).
+ * Stages an owner transaction for its Safe. Pass a hardhat-deploy action (`() => execute(...)`): it runs directly
+ * when hardhat-deploy can sign for `from`, and is staged when it can't. Or pass what `catchUnknownSigner` returned
+ * (`null` stages nothing). Each run stages into one file per Safe, written after every call:
+ * `safe-batches/<network>/<timestamp>-<safe>.json` (on a local node, `<safe>.json`, marked as a fork rehearsal).
+ * Returns true when the transaction is left to the Safe, including when the same call is already staged.
  */
-export async function queueIfUnknownSigner(
+export async function stageSafeTx(
   hre: HardhatDeployRuntime,
-  batch: SafeBatch,
-  action: Promise<unknown> | (() => Promise<unknown>),
+  txOrAction: UnknownSignerTx | null | Promise<unknown> | (() => Promise<unknown>),
   options: AddOptions = {},
 ): Promise<boolean> {
+  const tx =
+    typeof txOrAction === "function" || txOrAction instanceof Promise
+      ? await catchUnknownSigner(hre, txOrAction)
+      : txOrAction;
+  if (!tx) return false;
+  if (!tx.to) throw new Error(`Unsigned tx from ${tx.from} deploys a contract; only calls can be staged for a Safe`);
+  const data = tx.data || "0x";
+  if (!isHex(data)) throw new Error(`Unsigned tx from ${tx.from} has non-hex data`);
+  const safe = getAddress(tx.from);
+  const call = { to: getAddress(tx.to), data, value: BigInt(tx.value ?? 0) };
+  const run = await stagingRun(hre);
+  const step = run.steps.then(() => stage(hre, run, safe, call, options));
+  run.steps = step.catch(() => undefined);
+  return step;
+}
+
+async function stage(
+  hre: HardhatDeployRuntime,
+  run: StagingRun,
+  safe: Address,
+  call: Required<SafeCall>,
+  options: AddOptions,
+): Promise<boolean> {
+  const { chainId, local, dir, createdAt, queue, files } = run;
+  const first = !files.has(safe);
+  if (first && !(await readSafe(hre.network.provider, safe))) throw new Error(`Owner ${safe} is not a Safe`);
+  if (!queue.add(safe, call, options)) {
+    console.warn(`Skipped a call from ${safe} to ${call.to}: the same call is already staged for that contract`);
+    return true;
+  }
+
+  const stamp = new Date(createdAt).toISOString();
+  const file = path.join(dir, `${local ? "" : `${compactStamp(stamp)}-`}${safe6(safe)}.json`);
+  files.set(safe, file);
+  const title = `Deploy ${stamp.slice(0, 10)} ${stamp.slice(11, 16)} UTC`;
+  const batch = createSafeBatch({
+    chainId,
+    safe,
+    calls: queue.calls(safe),
+    name: local ? `${FORK_MARKER}${title}` : title,
+    createdAt,
+  });
+  // A live run never replaces a file it didn't start; a local run replaces its previous rehearsal file.
+  await writeFile(file, `${JSON.stringify(batch, null, 2)}\n`, { flag: first && !local ? "wx" : "w" });
+  return true;
+}
+
+function stagingRun(hre: HardhatDeployRuntime): Promise<StagingRun> {
+  let run = runs.get(hre);
+  if (!run) {
+    run = startRun(hre);
+    runs.set(hre, run);
+    // A run that failed to start (e.g. an RPC blip) is retried by the next call.
+    run.catch(() => runs.delete(hre));
+  }
+  return run;
+}
+
+async function startRun(hre: HardhatDeployRuntime): Promise<StagingRun> {
+  const dir = stagedDir(hre);
+  await mkdir(dir, { recursive: true });
+  return {
+    chainId: await publicClientFor(hre.network.provider).getChainId(),
+    local: await isLocal(hre),
+    dir,
+    createdAt: Date.now(),
+    queue: new CallQueue(),
+    files: new Map(),
+    steps: Promise.resolve(),
+  };
+}
+
+// A fork: the node reports Hardhat or Anvil, or the network has a usual fork name (the node check misses hosted
+// forks). Staging marks its files as rehearsals, and proposing never posts from one.
+async function isLocal(hre: HardhatDeployRuntime): Promise<boolean> {
+  return (
+    (await localNodeVersion(hre.network.provider)) !== undefined || ["hardhat", "localhost"].includes(hre.network.name)
+  );
+}
+
+async function catchUnknownSigner(
+  hre: HardhatDeployRuntime,
+  action: Promise<unknown> | (() => Promise<unknown>),
+): Promise<UnknownSignerTx | null> {
   // Hand the action to hardhat-deploy before awaiting anything else: an already-started promise that rejects
   // while unobserved would crash Node.
   const run = typeof action === "function" ? action() : action;
@@ -66,23 +170,14 @@ export async function queueIfUnknownSigner(
   if (!tx) {
     await settled;
     await warnIfSentBySafe(hre, result);
-    return false;
   }
-  if (!tx.to) throw new Error(`Unsigned tx from ${tx.from} deploys a contract; only calls can be queued for a Safe`);
-  const data = tx.data || "0x";
-  if (!isHex(data)) throw new Error(`Unsigned tx from ${tx.from} has non-hex data`);
-  const from = getAddress(tx.from);
-  const to = getAddress(tx.to);
-  if (!batch.add(from, { to, data, value: BigInt(tx.value ?? 0) }, options)) {
-    console.warn(`Skipped a call from ${from} to ${to}: the same call is already queued for that contract`);
-  }
-  return true;
+  return tx;
 }
 
 const checkedSenders = new WeakMap<HardhatDeployRuntime, Set<string>>();
 
 // A Safe has no key, so a receipt sent by one means the node impersonated it (hardhat-deploy's autoImpersonate,
-// or an impersonation on the node): the call ran directly instead of being queued and rehearsed through the Safe.
+// or an impersonation on the node): the call ran directly instead of being staged and rehearsed through the Safe.
 async function warnIfSentBySafe(hre: HardhatDeployRuntime, result: unknown): Promise<void> {
   const from = (result as { from?: unknown } | null | undefined)?.from;
   if (typeof from !== "string" || !isAddress(from, { strict: false })) return;
@@ -91,101 +186,235 @@ async function warnIfSentBySafe(hre: HardhatDeployRuntime, result: unknown): Pro
   if (checked.has(from.toLowerCase())) return;
   checked.add(from.toLowerCase());
   try {
-    const client = publicClientFor(hre.network.provider);
-    if (!(await readSafe(client, getAddress(from)))) return;
+    if (!(await readSafe(hre.network.provider, getAddress(from)))) return;
   } catch {
     return;
   }
   console.warn(
-    `Safe ${from} executed a call directly because the node impersonates it, so the call was not queued or ` +
+    `Safe ${from} executed a call directly because the node impersonates it, so the call was not staged or ` +
       "rehearsed through the Safe. Set HARDHAT_DEPLOY_NO_IMPERSONATION=1 (or `autoImpersonate: false`) and " +
       "don't impersonate the Safe on the node.",
   );
 }
 
-export interface FlushOptions {
-  name: string;
-  description?: string;
-  /** Relative to the Hardhat project root. Defaults to `safe-batches/<network>`. */
-  outDir?: string;
-  /** Execute the written files. Defaults to true on a local Hardhat or Anvil node. */
-  rehearse?: boolean;
-  /** Allow calls with calldata to addresses without code, which otherwise fail the flush. */
+export interface ProposeStagedOptions extends TxServiceOptions {
+  /** An owner or proposer of the Safes. Defaults to Hardhat's `deployer` account, signing with `personal_sign`. */
+  signer?: ProposalSigner;
+  /** Staged files to handle. Defaults to this run's files, or every staged file for the network if none. */
+  files?: string[];
+  origin?: string;
   allowCallsWithoutCode?: boolean;
+  /**
+   * Skip the confirmation for files this run did not stage (explicit `files`, or older staged files). Without it,
+   * those are only proposed after a yes on a terminal, and refused without one (e.g. in CI).
+   */
+  yes?: boolean;
+  /** Asks the question; defaults to a [y/N] prompt on the terminal. */
+  confirm?: (question: string) => Promise<boolean>;
 }
 
-export interface FlushedBatch {
-  safe: Address;
+export interface StagedResult {
   file: string;
-  calls: number;
+  safe: Address;
+  /** Set on a live network: what the Safe service said, and the proposal if one was made. */
+  status?: ProposeSafeBatchResult;
+  /** Set on a local node: the rehearsal through the Safe. */
   execution?: ForkExecution;
+  /** Whether the file was deleted: once proposed, pending or executed, it must not be imported again. */
+  removed: boolean;
+  /** Why the file was not handled: refused (fork file, edited, wrong chain) or failed (e.g. the service said no). */
+  failure?: string;
 }
 
 /**
- * Writes one Transaction Builder file per Safe in `batch`. On a local Hardhat or Anvil node the files are read back
- * and executed, so the rehearsal runs exactly what signers will import, and the file name is marked as a fork
- * rehearsal. On any other node, file names carry a timestamp and an existing file is never replaced. If any write
- * or rehearsal fails, every file this flush wrote is removed.
+ * Handles staged files at the end of a deploy, or later. On a live network each file is checked against its Safe
+ * (see `safeBatchStatus`) and proposed exactly as written when fresh, then deleted; a file whose calls are already
+ * pending or executed is deleted without proposing; a file that partly overlaps them is kept and reported. Files this
+ * run did not stage are first shown as a plan and need a yes (or `yes`). On a local node, or a network named `hardhat`
+ * or `localhost`, files are rehearsed through the Safe instead and kept. A file that is refused or fails doesn't stop
+ * the others; the call throws at the end if any did.
  */
-export async function flushSafeBatch(
+export async function proposeStagedSafeBatches(
   hre: HardhatDeployRuntime,
-  batch: SafeBatch,
-  options: FlushOptions,
-): Promise<FlushedBatch[]> {
-  if (batch.size === 0) return [];
-  const prefix = slug(options.name);
-  if (!prefix) throw new Error(`Batch name ${JSON.stringify(options.name)} needs at least one letter or digit`);
-
+  options: ProposeStagedOptions = {},
+): Promise<StagedResult[]> {
+  const run = await runs.get(hre)?.catch(() => undefined);
+  runs.delete(hre);
+  await run?.steps;
+  const ours = run ? [...run.files.values()] : [];
   const provider = hre.network.provider;
-  const client = publicClientFor(provider);
-  const chainId = await client.getChainId();
-  // Decided by the node, not the network name: a fork can have any name, and `localhost` can point anywhere.
-  const local = (await localNodeVersion(provider)) !== undefined;
-  const rehearse = options.rehearse ?? local;
-
-  for (const safe of batch.safes) {
-    if (!(await readSafe(client, safe))) throw new Error(`Queued owner ${safe} is not a Safe`);
-    if (!options.allowCallsWithoutCode) await assertCallTargetsHaveCode(client, batch.calls(safe));
+  const local = await isLocal(hre);
+  // A fork rehearses only what this run staged: leftovers from other fork runs belong to other state.
+  const files = options.files ?? (ours.length > 0 || local ? ours : await listStagedFiles(hre));
+  if (!options.files && ours.length > 0) {
+    const older = (await listStagedFiles(hre)).filter(f => !ours.includes(f));
+    if (older.length > 0) console.log(`Left for later: ${older.map(f => path.basename(f)).join(", ")}\n`);
   }
+  const results: StagedResult[] = [];
+  const handle = async (file: string, act: (batch: SafeBatch) => Promise<Omit<StagedResult, "file">>) => {
+    const batch = await readSafeBatch(file);
+    const line = { file, safe: batchSafe(batch), calls: batch.transactions.length };
+    try {
+      const result = { file, ...(await act(batch)) };
+      results.push(result);
+      const lines = result.failure
+        ? refused(result.failure)
+        : result.execution
+          ? rehearsed(result.execution.txHash)
+          : result.status
+            ? verdict(result.status, false)
+            : kept();
+      printFile(line, lines);
+    } catch (error) {
+      const failure = describeError(error);
+      results.push({ file, safe: line.safe, removed: false, failure });
+      printFile(line, refused(failure));
+    }
+  };
 
-  const root = hre.config?.paths.root ?? process.cwd();
-  const outDir = path.resolve(root, options.outDir ?? path.join("safe-batches", hre.network.name));
-  await mkdir(outDir, { recursive: true });
-
-  const createdAt = Date.now();
-  // Live runs flush under fixed names, so a timestamp keeps a second run from colliding with the first.
-  const suffix = local ? "" : `-${new Date(createdAt).toISOString().replace(/[-:.]/g, "")}`;
-  const flushed: FlushedBatch[] = [];
-  try {
-    for (const safe of batch.safes) {
-      const file = createBatchFile({
-        chainId,
-        safe,
-        calls: batch.calls(safe),
-        name: local ? `${FORK_MARKER}${options.name}` : options.name,
-        createdAt,
-        ...(options.description === undefined ? {} : { description: options.description }),
+  if (local) {
+    const node = nodeProvider(hre);
+    for (const file of files) {
+      await handle(file, async batch => {
+        const execution = await rehearseSafeBatch(node, batch, rehearseOptions(options));
+        return { safe: execution.safe, execution, removed: false };
       });
-      const entry = {
-        safe,
-        file: path.join(outDir, `${prefix}-${chainId}-${safe}${suffix}.json`),
-        calls: file.transactions.length,
-      };
-      await writeFile(entry.file, `${JSON.stringify(file, null, 2)}\n`, { flag: local ? "w" : "wx" });
-      flushed.push(entry);
     }
-    if (rehearse) {
-      const node = nodeProvider(hre);
-      const forkOptions = { allowCallsWithoutCode: options.allowCallsWithoutCode ?? false };
-      for (const entry of flushed) entry.execution = await executeBatchFileOnFork(node, entry.file, forkOptions);
-    }
-  } catch (error) {
-    // A failed flush must not leave a valid-looking file behind for signers or a retry.
-    await Promise.all(flushed.map(({ file }) => rm(file, { force: true })));
-    throw error;
+    return finish(results);
   }
-  batch.clear();
-  return flushed;
+
+  if (files.length === 0) return results;
+  const service = await resolveTxService(await publicClientFor(provider).getChainId(), options);
+  // The deploy that just staged a file is the decision to propose it; anything else is shown first and confirmed.
+  // Files from a plan: only those it counted to propose or delete are acted on, whatever changed since.
+  const approved = files.some(f => !ours.includes(f)) ? await approve(hre, service, files, options) : undefined;
+  if (approved?.size === 0) return results;
+  const signer = options.signer ?? (await deployerSigner(hre));
+  // After a file for a Safe fails, later ones for it wait: one that may have landed would share their nonce, and one
+  // that didn't would end up behind them.
+  const stopped = new Set<Address>();
+  for (const file of files) {
+    await handle(file, async batch => {
+      const safe = batchSafe(batch);
+      if (stopped.has(safe)) return { safe, removed: false, failure: "skipped: an earlier file for this Safe failed" };
+      const refusal = refusalOf(batch, service);
+      if (refusal) return { safe, removed: false, failure: refusal };
+      if (approved && !approved.has(file)) return { safe, removed: false };
+      // Checked again here: the plan may be stale by now.
+      const status = await proposeSafeBatch(provider, service, signer, batch, {
+        ...(options.origin === undefined ? {} : { origin: options.origin }),
+        ...rehearseOptions(options),
+      });
+      const removed = shouldDelete(status);
+      if (removed) await rm(file, { force: true });
+      return { safe, status, removed };
+    });
+    const last = results.at(-1);
+    if (last?.failure) stopped.add(last.safe);
+  }
+  return finish(results);
+}
+
+function finish(results: StagedResult[]): StagedResult[] {
+  const failed = results.filter(r => r.failure);
+  if (failed.length > 0) {
+    const reasons = failed.map(r => `${path.basename(r.file)}: ${r.failure}`).join("; ");
+    throw new Error(`${failed.length} staged file(s) refused or failed: ${reasons}`);
+  }
+  return results;
+}
+
+// Prints the plan for `files` and asks whether to carry it out.
+async function approve(
+  hre: HardhatDeployRuntime,
+  service: TxService,
+  files: string[],
+  options: ProposeStagedOptions,
+): Promise<Set<string>> {
+  printFolder(stagedDir(hre), files.length);
+  const toPropose = new Set<string>();
+  const toDelete = new Set<string>();
+  const refusals: string[] = [];
+  // Fresh files for one Safe are proposed one after another, so each takes the next nonce.
+  const nextNonce = new Map<string, bigint>();
+  for (const file of files) {
+    const batch = await readSafeBatch(file);
+    const safe = batchSafe(batch);
+    const refusal = refusalOf(batch, service);
+    if (refusal) refusals.push(`${path.basename(file)}: ${refusal}`);
+    let status = refusal ? undefined : await safeBatchStatus(hre.network.provider, service, batch);
+    if (status?.status === "fresh") {
+      const nonce = nextNonce.get(safe) ?? status.nextNonce;
+      nextNonce.set(safe, nonce + 1n);
+      status = { ...status, nextNonce: nonce };
+      toPropose.add(file);
+    } else if (status && shouldDelete(status)) toDelete.add(file);
+    printFile(
+      { file, safe, calls: batch.transactions.length },
+      refusal ? refused(refusal) : status ? verdict(status, true) : [],
+    );
+  }
+  const approved = new Set([...toPropose, ...toDelete]);
+  if (approved.size === 0) {
+    if (refusals.length > 0) throw new Error(`${refusals.length} staged file(s) refused: ${refusals.join("; ")}`);
+    console.log("Nothing to propose or delete.");
+    return approved;
+  }
+  if (options.yes) return approved;
+  const question = `Propose ${toPropose.size} file(s) and delete ${toDelete.size}? [y/N] `;
+  return (await ask(question, options)) ? approved : new Set();
+}
+
+async function ask(question: string, options: ProposeStagedOptions): Promise<boolean> {
+  if (options.confirm) return options.confirm(question);
+  if (!process.stdin.isTTY) {
+    throw new Error("Not proposing files this run did not stage without a confirmation: use a terminal or --yes");
+  }
+  const prompt = createInterface({ input: process.stdin, output: process.stdout });
+  try {
+    return /^y(es)?$/i.test((await prompt.question(question)).trim());
+  } finally {
+    prompt.close();
+  }
+}
+
+// Why a file can't be proposed at all, before asking the Safe service anything.
+function refusalOf(batch: SafeBatch, service: TxService): string | undefined {
+  // The marker is outside the checksum and isn't posted, so signers would never see it.
+  if (batch.meta.name.startsWith(FORK_MARKER)) return "fork rehearsal file, never proposed";
+  if (!validateSafeBatch(batch)) return "invalid checksum (edited after staging), refused";
+  if (batch.chainId !== String(service.chainId)) return `for chain ${batch.chainId}, refused`;
+  return undefined;
+}
+
+// Once proposed, pending (on an uncontested nonce) or executed, a file must not be imported or proposed again.
+function shouldDelete(result: ProposeSafeBatchResult): boolean {
+  return !!result.proposal || (!!result.match && (result.status === "executed" || !result.contested));
+}
+
+// What proposeStagedSafeBatches would do with a batch, without proposing or deleting anything.
+async function predict(provider: Eip1193Provider, service: TxService, batch: SafeBatch): Promise<string[]> {
+  const refusal = refusalOf(batch, service);
+  return refusal ? refused(refusal) : verdict(await safeBatchStatus(provider, service, batch), true);
+}
+
+export interface StagedSafeBatch {
+  file: string;
+  batch: SafeBatch;
+}
+
+/** Staged files for a network (default: the current one), oldest first. */
+export async function listStagedSafeBatches(
+  hre: HardhatDeployRuntime,
+  network = hre.network.name,
+): Promise<StagedSafeBatch[]> {
+  const files = await listStagedFiles(hre, network);
+  return Promise.all(files.map(async file => ({ file, batch: await readSafeBatch(file) })));
+}
+
+/** Deletes a staged file, e.g. one that should never be proposed. */
+export async function discardSafeBatch(file: string): Promise<void> {
+  await rm(file);
 }
 
 /**
@@ -199,35 +428,136 @@ export function nodeProvider(hre: HardhatDeployRuntime): Eip1193Provider {
   return { request: transport({}).request };
 }
 
-export async function readBatchFile(filePath: string): Promise<BatchFile> {
-  const file = JSON.parse(await readFile(filePath, "utf8")) as BatchFile;
-  if (!validateChecksum(file)) throw new Error(`${filePath} has an invalid checksum`);
-  return file;
+interface TaskArgs {
+  from?: string;
+  file?: string;
+  yes?: boolean;
 }
 
-export interface RehearseOptions extends ForkOptions {
-  /** Rehearse a file made for another chain, e.g. a mainnet file on a Hardhat fork running as 31337. */
-  allowChainMismatch?: boolean;
+/** The part of Hardhat's `task()` builder the Safe tasks use, so this package doesn't import Hardhat. */
+export interface TaskDefinition {
+  addOptionalParam(name: string, description?: string): TaskDefinition;
+  addFlag(name: string, description?: string): TaskDefinition;
+  setAction(action: (args: TaskArgs, hre: HardhatDeployRuntime) => Promise<unknown>): TaskDefinition;
 }
 
-export async function executeBatchFileOnFork(
-  provider: Eip1193Provider,
-  filePath: string,
-  options: RehearseOptions = {},
-): Promise<ForkExecution> {
-  const file = await readBatchFile(filePath);
-  const safe = file.meta.createdFromSafeAddress;
-  if (!safe) throw new Error(`${filePath} does not name its Safe (meta.createdFromSafeAddress)`);
-  const chainId = await publicClientFor(provider).getChainId();
-  if (!options.allowChainMismatch && file.chainId !== String(chainId)) {
-    throw new Error(`${filePath} is for chain ${file.chainId}, but the fork runs chain ${chainId}`);
-  }
-  return executeOnFork(provider, getAddress(safe), batchFileCalls(file), options);
+export interface SafeTasksOptions {
+  /** The proposer for `safe:propose`. Defaults to Hardhat's `deployer` account. */
+  signer?: (hre: HardhatDeployRuntime) => ProposalSigner | Promise<ProposalSigner>;
+  /** Defaults to the `SAFE_API_KEY` environment variable. */
+  apiKey?: string;
+  /** The Safe Transaction Service to use instead of Safe's own for the chain. */
+  txServiceUrl?: string;
 }
 
-function slug(name: string): string {
-  return name
-    .toLowerCase()
-    .replace(/[^a-z0-9]+/g, "-")
-    .replace(/^-|-$/g, "");
+/**
+ * Registers `safe:list`, `safe:rehearse`, `safe:propose` and `safe:discard`. In hardhat.config, pass Hardhat's
+ * `task`: `registerSafeTasks(task)`.
+ */
+export function registerSafeTasks(
+  task: (name: string, description?: string) => TaskDefinition,
+  options: SafeTasksOptions = {},
+): void {
+  const serviceOptions = (): TxServiceOptions => {
+    const apiKey = options.apiKey ?? process.env.SAFE_API_KEY;
+    return { ...(apiKey ? { apiKey } : {}), ...(options.txServiceUrl ? { txServiceUrl: options.txServiceUrl } : {}) };
+  };
+
+  task("safe:list", "List staged Safe batches and, on a live network, what safe:propose would do with each")
+    .addOptionalParam("from", "Network whose staged files to list (default: --network)")
+    .setAction(async (args, hre) => {
+      const staged = await listStagedSafeBatches(hre, args.from);
+      // Status needs the Safe service of the files' own chain: only the live network itself.
+      const live = staged.length > 0 && (args.from ?? hre.network.name) === hre.network.name && !(await isLocal(hre));
+      const chainId = live ? await publicClientFor(hre.network.provider).getChainId() : undefined;
+      const service = chainId === undefined ? undefined : await resolveTxService(chainId, serviceOptions());
+      printFolder(stagedDir(hre, args.from), staged.length);
+      for (const { file, batch } of staged) {
+        const lines = service ? await predict(hre.network.provider, service, batch) : [];
+        printFile({ file, safe: batchSafe(batch), calls: batch.transactions.length }, lines);
+      }
+    });
+
+  task("safe:rehearse", "Rehearse staged batches of --from on an in-process fork of it (use --network hardhat)")
+    .addOptionalParam("from", "Network whose staged files to rehearse, forked from its URL")
+    .addOptionalParam("file", "One staged file instead of all")
+    .setAction(async (args, hre) => {
+      if (!args.from) throw new Error("Pass --from <network>, e.g. --from mainnet");
+      // A reset on any other network would wipe a running node's state.
+      if (hre.network.name !== "hardhat") throw new Error("Run safe:rehearse with --network hardhat");
+      const { url } = (hre.config?.networks?.[args.from] ?? {}) as { url?: string };
+      if (!url) throw new Error(`Network ${args.from} has no URL to fork`);
+      const chainId = await publicClientFor({ request: http(url)({}).request }).getChainId();
+      await hre.network.provider.request({ method: "hardhat_reset", params: [{ forking: { jsonRpcUrl: url } }] });
+      for (const file of args.file ? [args.file] : await listStagedFiles(hre, args.from)) {
+        const batch = await readSafeBatch(file);
+        // The in-process fork keeps Hardhat's own chain id, so check the batch against the forked chain instead.
+        if (batch.chainId !== String(chainId))
+          throw new Error(`${path.basename(file)} is for chain ${batch.chainId}, not ${args.from}`);
+        const execution = await rehearseSafeBatch(hre.network.provider, batch, { allowChainMismatch: true });
+        printFile({ file, safe: execution.safe, calls: batch.transactions.length }, rehearsed(execution.txHash));
+      }
+    });
+
+  task("safe:propose", "Show the plan for staged Safe batches, then propose them after a yes")
+    .addOptionalParam("file", "One staged file instead of all")
+    .addFlag("yes", "Skip the confirmation, e.g. in CI")
+    .setAction(async (args, hre) => {
+      await proposeStagedSafeBatches(hre, {
+        files: args.file ? [args.file] : await listStagedFiles(hre),
+        ...(args.yes ? { yes: true } : {}),
+        ...(options.signer ? { signer: await options.signer(hre) } : {}),
+        ...serviceOptions(),
+      });
+    });
+
+  task("safe:discard", "Delete a staged Safe batch")
+    .addOptionalParam("file", "The staged file")
+    .setAction(async args => {
+      if (!args.file) throw new Error("Pass --file <staged file>");
+      await discardSafeBatch(args.file);
+    });
+}
+
+// Signs through Hardhat's provider as the `deployer` named account. proposeSafeBatch checks that the signature
+// recovers to that address before posting, so a misconfigured account fails before reaching the service.
+async function deployerSigner(hre: HardhatDeployRuntime): Promise<ProposalSigner> {
+  const address = (await hre.getNamedAccounts?.())?.deployer;
+  if (!address) throw new Error("No proposer: pass `signer`, or set Hardhat's `deployer` named account");
+  return {
+    address,
+    signMessage: ({ message }) =>
+      hre.network.provider.request({ method: "personal_sign", params: [message.raw, address] }) as Promise<string>,
+  };
+}
+
+function rehearseOptions(options: ProposeStagedOptions) {
+  return options.allowCallsWithoutCode ? { allowCallsWithoutCode: true } : {};
+}
+
+function stagedDir(hre: HardhatDeployRuntime, network = hre.network.name): string {
+  return path.resolve(hre.config?.paths.root ?? process.cwd(), "safe-batches", network);
+}
+
+async function listStagedFiles(hre: HardhatDeployRuntime, network = hre.network.name): Promise<string[]> {
+  const dir = stagedDir(hre, network);
+  const names = await readdir(dir).catch(() => []);
+  return names
+    .filter(n => n.endsWith(".json"))
+    .sort()
+    .map(n => path.join(dir, n));
+}
+
+async function readSafeBatch(file: string): Promise<SafeBatch> {
+  return JSON.parse(await readFile(file, "utf8")) as SafeBatch;
+}
+
+// "2026-10-01T15:30:00.123Z" -> "20261001T153000Z": sorts in order, unique to the second.
+function compactStamp(iso: string): string {
+  return iso.replace(/\.\d+Z$/, "Z").replace(/[-:]/g, "");
+}
+
+// The first 6 hex digits name the Safe in a file name; the file holds the full address.
+function safe6(safe: Address): string {
+  return safe.slice(0, 8).toLowerCase();
 }
