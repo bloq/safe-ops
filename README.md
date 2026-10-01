@@ -2,6 +2,16 @@
 
 Stage owner transactions for Safe multisigs as Safe Transaction Builder files, rehearse those files on a fork exactly as the Safe will execute them, and propose them to the Safe Transaction Service.
 
+## Install
+
+Not on npm: install a release tag from git. Each tag carries the built `dist`, so nothing is built on install.
+
+```json
+"@bloq/safe-ops": "github:bloq/safe-ops#v0.2.0"
+```
+
+Needs `viem` 2.42 or later as a peer.
+
 ## Usage with hardhat-deploy
 
 ```ts
@@ -83,3 +93,5 @@ pnpm test
 FORK_URL=<ethereum rpc> HEMI_FORK_URL=<hemi rpc> pnpm test:fork   # needs anvil
 pnpm build
 ```
+
+To release, bump `version` on a branch and merge it, then on the merged `main`: `pnpm release` builds and tags `v<version>` on a commit that adds `dist` on top of `main` (on no branch), and prints the `git push origin v<version>` to run. The dev dependency on `viem` stays pinned to the oldest supported version, so the tests cover it.

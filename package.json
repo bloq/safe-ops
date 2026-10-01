@@ -1,7 +1,7 @@
 {
   "name": "@bloq/safe-ops",
   "version": "0.2.0",
-  "description": "Queue, export, rehearse and propose owner transactions for Safe multisigs",
+  "description": "Stage, rehearse and propose owner transactions for Safe multisigs",
   "license": "MIT",
   "author": "Rohit Solia <rohit@bloq.com>",
   "private": true,
@@ -47,13 +47,14 @@
     "format": "prettier --write . && eslint --fix .",
     "test": "vitest run --project unit",
     "test:fork": "vitest run --project fork",
-    "test:watch": "vitest --project unit"
+    "test:watch": "vitest --project unit",
+    "release": "sh scripts/release.sh"
   },
   "dependencies": {
     "@safe-global/safe-deployments": "1.37.63"
   },
   "peerDependencies": {
-    "viem": "^2.57.0"
+    "viem": "^2.42.0"
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",
@@ -66,7 +67,7 @@
     "tsup": "^8.5.1",
     "typescript": "~6.0.3",
     "typescript-eslint": "^8.71.0",
-    "viem": "^2.57.0",
+    "viem": "2.42.1",
     "vitest": "^5.0.2"
   }
 }

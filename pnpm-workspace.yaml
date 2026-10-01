@@ -1,2 +1,5 @@
 allowBuilds:
   esbuild: true
+overrides:
+  # viem 2.42 (the pinned dev floor) pulls ws 8.18, which has advisories; consumers bring their own viem.
+  ws: ^8.21.0
