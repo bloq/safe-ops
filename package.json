@@ -2,8 +2,24 @@
   "name": "@bloq/safe-ops",
   "version": "0.2.0",
   "description": "Stage, rehearse and propose owner transactions for Safe multisigs",
+  "keywords": [
+    "safe",
+    "gnosis-safe",
+    "multisig",
+    "hardhat",
+    "hardhat-deploy",
+    "ethereum"
+  ],
   "license": "MIT",
   "author": "Rohit Solia <rohit@bloq.com>",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/bloq/safe-ops"
+  },
+  "homepage": "https://github.com/bloq/safe-ops#readme",
+  "bugs": {
+    "url": "https://github.com/bloq/safe-ops/issues"
+  },
   "private": true,
   "type": "module",
   "engines": {
