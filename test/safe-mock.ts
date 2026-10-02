@@ -11,6 +11,8 @@ export interface MockOptions {
   clientVersion?: string;
   chainId?: number;
   version?: string;
+  /** The Safe's on-chain nonce. Defaults to SAFE_NONCE. */
+  nonce?: bigint;
   /** Addresses that have no code. Every other address answers as a 1-of-1 Safe owned by OWNER. */
   codeless?: readonly string[];
   /** Slot 0 of every contract, i.e. the Safe singleton. Defaults to the official Safe 1.4.1 singleton. */
@@ -25,7 +27,7 @@ export function safeProvider(options: MockOptions = {}): Eip1193Provider {
     VERSION: options.version ?? "1.4.1",
     getThreshold: 1n,
     getOwners: [OWNER],
-    nonce: SAFE_NONCE,
+    nonce: options.nonce ?? SAFE_NONCE,
   };
   const codeless = new Set((options.codeless ?? []).map(a => a.toLowerCase()));
   return {

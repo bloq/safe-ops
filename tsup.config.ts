@@ -7,5 +7,5 @@ export default defineConfig({
   dts: { compilerOptions: { ignoreDeprecations: "6.0" } },
   sourcemap: true,
   clean: true,
-  target: "node20",
+  target: "node22",
 });

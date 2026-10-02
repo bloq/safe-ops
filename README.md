@@ -10,7 +10,7 @@ Not on npm: install a release tag from git. Each tag carries the built `dist`, s
 "@bloq/safe-ops": "github:bloq/safe-ops#v0.2.0"
 ```
 
-Needs `viem` 2.42 or later as a peer.
+Needs Node 22 or later, `viem` 2.42 or later as a peer, and TypeScript 5 for the typings.
 
 ## Usage with hardhat-deploy
 
@@ -32,6 +32,8 @@ const func: DeployFunction = async hre => {
 
 **Staging.** Each run stages into one Transaction Builder file per Safe, written after every call, in `safe-batches/<network>/<timestamp>-<safe>.json` (e.g. `20261001T153000Z-0xd1de3f.json`). The timestamp is the run's first staged call, so a long run is still one file. Inspect a file, or import it in the Safe UI (Apps → Transaction Builder), but never both import it and propose it.
 
+On a live network, calls a run makes again while they are still pending for the Safe are skipped with a warning, so the file holds only what is left to propose: deploy scripts can't see queued calls and stage them again on every run. Pending proposals execute before the file, so this only applies to calls made before anything new for that Safe; once a new call is staged, later pending calls are kept and the file reads as partial, rather than run out of the script's order. Only proposals that run as a batch would (plain calls, no refund) on a nonce without competing proposals count. Each Safe's queue is read once per run, on its first call; if the Safe service can't be read, staging warns and goes on without the check. `stagedFilesThisRun(hre)` returns the files staged so far, e.g. to record them, or to stop the deploy once something is left to the Safe.
+
 **Proposing** (`proposeStagedSafeBatches`) handles this run's files, or every staged file for the network when the run staged nothing (e.g. a later run of just the last script); older files are left for later and named in the log. A file staged on a fork is never proposed. Each file is checked against its Safe first:
 
 | File                                                                      | Result                                                                                                        |
@@ -47,8 +49,12 @@ It also warns when something executed since staging changed the file's contracts
 
 **On a local node** (Hardhat or Anvil by `web3_clientVersion`), or a network named `hardhat` or `localhost`, nothing is ever proposed: the files are rehearsed through the real Safe instead, and kept. Local files are named `<safe>.json`, replaced by each run, and marked `FORK REHEARSAL, DO NOT SIGN`; a fork run rehearses only what it staged itself.
 
-- **Proposer:** defaults to Hardhat's `deployer` account, signing through Hardhat's provider. Pass `signer` for another one: any object with `address` and `signMessage({ message: { raw } })`, such as a viem account of any version, or an ethers wallet wrapped as `{ address: w.address, signMessage: ({ message }) => w.signMessage(getBytes(message.raw)) }` (ethers v6; v5 uses `utils.arrayify`). It must be an owner or a proposer of the Safe (owners add proposers in the Safe UI settings). The signature is checked against that address before anything is posted.
-- **Service:** looked up per chain from Safe's config service; pass `txServiceUrl` for another one. Either way it must report the node's chain. api.safe.global needs an `apiKey` (developer.safe.global). Requests time out after 30 seconds; a proposal that timed out may still have landed, and the next run finds it pending.
+- **Proposer:** defaults to Hardhat's `deployer` account, signing through Hardhat's provider. Pass `signer` for another one, e.g. when Hardhat has no key for `deployer`: any object with `address` and `signMessage({ message: { raw } })`, such as a viem account of any version (`privateKeyToAccount(key)`, `mnemonicToAccount(mnemonic)` from `viem/accounts`), or an ethers wallet wrapped as `{ address: w.address, signMessage: ({ message }) => w.signMessage(getBytes(message.raw)) }` (ethers v6; v5 uses `utils.arrayify`). It must be an owner or a proposer of the Safe (owners add proposers in the Safe UI settings). The signature is checked against that address before anything is posted.
+- **Service:** looked up per chain from Safe's config service; pass `txServiceUrl` for another one, or URLs by chain id (`{ 743111: "https://…/api" }`) for chains Safe doesn't serve. Either way it must report the node's chain. api.safe.global needs an API key (developer.safe.global): `apiKey` defaults to `SAFE_API_KEY` for staging, proposing and the tasks. Pass the same service options to `stageSafeTx` and `proposeStagedSafeBatches`. A redirect is refused rather than followed, since it would drop the key: old `safe-transaction-<chain>.safe.global` URLs name the one to use. Requests time out after 30 seconds; a proposal that timed out may still have landed, and the next run finds it pending.
+- **Service lag:** right after an execution, the service may not have indexed it yet, so its proposal would look neither pending nor executed. While the service still lists the proposal at the Safe's latest used nonce as not executed, checking a file fails with "try again in a minute".
+- **What signers see:** each proposal names `safe-ops` as its origin (`origin` to change it) and notes the file's name, e.g. `Deploy 2026-10-01 15:30 UTC`, in the Safe UI.
+- **Nonce gaps:** a proposal goes after every pending one, so a nonce nobody proposed yet holds it back; the verdict warns.
+- **Safe versions:** proposing needs a Safe of 1.3.0 or later; before that, a call that fails still uses up the nonce.
 - **Duplicates while staging:** a call identical to the latest call staged for the same contract is dropped with a warning, since deploy scripts check executed state and can't see staged calls. `x.update(1), x.update(2), x.update(1)` keeps all three. A deliberate repeat, such as a second `harvest()`, needs `{ allowDuplicate: true }`.
 - **Targets must have code:** calldata to an address without code does nothing on chain, so proposals and rehearsals refuse it unless `allowCallsWithoutCode` is set.
 - **Impersonated Safes:** when the node impersonates a Safe (hardhat-deploy's `autoImpersonate`, or an impersonation on the node), its calls run directly and nothing is staged; `stageSafeTx` warns. Set `HARDHAT_DEPLOY_NO_IMPERSONATION=1` (or `autoImpersonate: false`).
@@ -69,7 +75,7 @@ npx hardhat safe:propose --network mainnet [--file …] [--yes]   # shows the pl
 npx hardhat safe:discard --network mainnet --file …
 ```
 
-`safe:list` on a live network runs the same status check as `safe:propose` and says what would happen to each file (proposed at which nonce, deleted as pending or executed, or kept as partial), without doing it. `registerSafeTasks(task, { apiKey, txServiceUrl, signer })` sets the service and proposer for the tasks (`apiKey` defaults to `SAFE_API_KEY`). `safe:rehearse` resets the in-process Hardhat network (it refuses any other) to a fork of `--from`'s URL, and checks each file is for that chain. Hardhat can't fork every chain (Hemi, for one); use Anvil and `rehearseSafeBatch` there. The rehearsal runs at the Safe's current nonce without the proposals already pending, so execute or reject those first if the batch depends on them.
+`safe:list` on a live network runs the same status check as `safe:propose` and says what would happen to each file (proposed at which nonce, deleted as pending or executed, or kept as partial), without doing it. `registerSafeTasks(task, { apiKey, txServiceUrl, signer })` sets the service and proposer for the tasks. `safe:rehearse` resets the in-process Hardhat network (it refuses any other) to a fork of `--from`'s URL, and checks each file is for that chain. On a chain Hardhat doesn't know (Hemi, Plasma), calls at the fork block fail with "No known hardfork" unless the `hardhat` network sets `chains: { 43111: { hardforkHistory: { cancun: 1 } } }`. The rehearsal runs at the Safe's current nonce without the proposals already pending, so execute or reject those first if the batch depends on them.
 
 `nodeProvider(hre)` is the node itself for an HTTP network: on a network with `accounts` (keys from `.env`), Hardhat's own provider signs locally and rejects impersonated owners (HH103). Rehearsals use it.
 
@@ -79,9 +85,10 @@ Everything takes an EIP-1193 provider and plain data; nothing reads files.
 
 - `createSafeBatch`, `validateSafeBatch`, `safeBatchCalls`: Transaction Builder files with the Safe UI's checksum.
 - `rehearseSafeBatch(provider, batch)`: runs a batch through its Safe on a local Hardhat or Anvil fork. `executeOnFork(provider, safe, calls)` does the same for raw calls: `threshold` impersonated owners approve, then `execTransaction`; batches go through the verified MultiSendCallOnly for the Safe's version (1.3.0 for older Safes), so they are atomic.
-- `resolveTxService`, `readSafeQueue`, `safeBatchStatus`, `proposeSafeBatch(provider, service, signer, batch)`: the checks and proposal described above.
+- `resolveTxService`, `readSafeQueue`, `safeBatchStatus`, `proposeSafeBatch(provider, service, signer, batch, { origin, note })`: the checks and proposal described above.
 - `decodeMultiSendCall`: the calls inside a `multiSend(bytes)` payload, e.g. a batch's data copied from the Safe UI.
-- `classifyAccount`, `readSafe`, `routeOwner`: EOA, EIP-7702 account, Safe or other contract, and whether a caller can act for an owner. A Safe is a proxy whose slot 0 holds an official Safe singleton (from safe-deployments); other contracts are never called. `isProposer` plugs into `routeOwner`: `routeOwner(provider, owner, caller, { isProposer: (safe, a) => isProposer(service, safe, a) })`.
+- `classifyAccount`, `readSafe`, `resolveOwnerRoute(provider, owner, caller, { service })`: EOA, EIP-7702 account, Safe or other contract, and how a caller can act for an owner: directly, through the owner's Safe, or not at all. A Safe is a proxy whose slot 0 holds an official Safe singleton (from safe-deployments); other contracts are never called. A caller that is not an owner of the Safe goes through it only as a proposer, which needs `service`.
+- `isProposer(provider, service, safe, account)`: whether an account is a proposer (delegate) of a Safe, counted as the service does: its delegator must still be an owner, and it must not have expired.
 
 ## Development
 

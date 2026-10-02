@@ -3,11 +3,12 @@ import { tmpdir } from "node:os";
 import path from "node:path";
 import { numberToHex, type Hex } from "viem";
 import { privateKeyToAccount } from "viem/accounts";
-import { afterEach, describe, expect, it, vi } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   nodeProvider,
   proposeStagedSafeBatches,
   registerSafeTasks,
+  stagedFilesThisRun,
   stageSafeTx,
   type HardhatDeployRuntime,
   type TaskDefinition,
@@ -21,7 +22,7 @@ import {
   type Eip1193Provider,
   type SafeBatch,
 } from "../src/index.js";
-import { safeProvider, serviceTx, type MockOptions } from "./safe-mock.js";
+import { SAFE_NONCE, safeProvider, serviceTx, type MockOptions } from "./safe-mock.js";
 
 const SAFE = "0x6649Ddb5c7e52348b73c8bBdD2A1cbA630b7AaEA";
 const SAFE_B = "0x9520b477Aa81180E6DdC006Fc09Fb6d3eb4e807A";
@@ -49,18 +50,40 @@ const STAGED_AT = Date.UTC(2026, 9, 1, 15, 30, 0, 123);
 const liveDir = (root: string) => path.join(root, "safe-batches", "mainnet");
 const readBatch = async (file: string) => JSON.parse(await readFile(file, "utf8")) as SafeBatch;
 
+const realFetch = globalThis.fetch;
+
+// Live staging asks the Safe service for pending calls: never let a test reach the real one.
+beforeEach(() => {
+  liveService();
+});
+
 afterEach(() => {
   vi.restoreAllMocks();
   vi.unstubAllGlobals();
+  vi.unstubAllEnvs();
 });
 
 /** A mainnet service with these pending and executed transactions; returns what was posted. */
 function liveService(pending: unknown[] = [], executed: unknown[] = []) {
   const posted: Record<string, unknown>[] = [];
   const fetch = vi.fn((url: string, init: { body?: string }) => {
+    // Test nodes on this machine are real.
+    if (url.startsWith("http://127.0.0.1")) return realFetch(url, init);
     if (init.body) posted.push(JSON.parse(init.body) as Record<string, unknown>);
-    const results = url.includes("executed=true") ? executed : pending;
-    const answer = init.body ? {} : url.includes("/about/") ? { chain_id: 1 } : { next: null, results };
+    // The Safe's latest execution is always indexed.
+    const indexed = url.includes(`?nonce=${SAFE_NONCE - 1n}&`);
+    const results = indexed
+      ? [{ ...serviceTx(Number(SAFE_NONCE - 1n), [call("0x00")], { executed: true }) }]
+      : url.includes("executed=true")
+        ? executed
+        : pending;
+    const answer = init.body
+      ? {}
+      : url.includes("safe-config")
+        ? { transactionService: "https://tx.example" }
+        : url.includes("/about/")
+          ? { chain_id: 1 }
+          : { next: null, results };
     return Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve(JSON.stringify(answer)) });
   });
   vi.stubGlobal("fetch", fetch);
@@ -110,6 +133,75 @@ describe("stageSafeTx", () => {
     const [name] = await readdir(liveDir(root));
     expect((await readBatch(path.join(liveDir(root), name ?? ""))).transactions).toHaveLength(1);
     expect(warn).toHaveBeenCalledWith(expect.stringMatching(/already staged/));
+  });
+
+  it("skips a call already pending on an uncontested nonce, so the file holds only what is left to propose", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    // An earlier run proposed 0x01 and 0x02; 0x03 sits on a nonce with a rival proposal, so it may never run.
+    const { fetch } = liveService([
+      serviceTx(39, [call("0x01"), call("0x02")]),
+      serviceTx(40, [call("0x03")]),
+      serviceTx(40, [call("0x09")]),
+    ]);
+    const hre = runtime(await tempRoot());
+    for (const data of ["0x01", "0x02", "0x03", "0x04"] as const) {
+      expect(await stageSafeTx(hre, unsignedCall(data))).toBe(true);
+    }
+    // After a new call, a pending one is kept: the pending proposal would run it ahead of the new one.
+    await stageSafeTx(hre, unsignedCall("0x02"));
+    // A deliberate repeat is staged anyway.
+    await stageSafeTx(hre, unsignedCall("0x01"), { allowDuplicate: true });
+    const [file] = await stagedFilesThisRun(hre);
+    expect((await readBatch(file ?? "")).transactions.map(t => t.data)).toEqual(["0x03", "0x04", "0x02", "0x01"]);
+    expect(warn.mock.calls.map(c => String(c[0]))).toEqual([
+      `Skipped a call from ${SAFE} to ${TARGET}: it is already pending at nonce 39`,
+      `Skipped a call from ${SAFE} to ${TARGET}: it is already pending at nonce 39`,
+    ]);
+    // The queue is read once per Safe and run.
+    expect(fetch.mock.calls.filter(c => c[0].includes("executed=false"))).toHaveLength(1);
+  });
+
+  it("leaves calls only to pending proposals that run them as a batch would", async () => {
+    vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    liveService([serviceTx(39, [call("0x01")], { gasPrice: "1" }), serviceTx(40, [call("0x02")], { operation: 1 })]);
+    const hre = runtime(await tempRoot());
+    await stageSafeTx(hre, unsignedCall("0x01"));
+    const [file] = await stagedFilesThisRun(hre);
+    expect((await readBatch(file ?? "")).transactions.map(t => t.data)).toEqual(["0x01"]);
+  });
+
+  it("checks the Safe on its first call even with allowDuplicate, and retries a check that failed", async () => {
+    const eoa = runtime(await tempRoot(), { slot0: EOA });
+    await expect(stageSafeTx(eoa, unsignedCall("0x01"), { allowDuplicate: true })).rejects.toThrow(/is not a Safe/);
+    await expect(stageSafeTx(eoa, unsignedCall("0x02"))).rejects.toThrow(/is not a Safe/);
+
+    const node = safeProvider();
+    // Down for the whole first attempt: viem retries a single failed request by itself.
+    let down = true;
+    const hre = runtime(await tempRoot());
+    hre.network.provider = {
+      request: args =>
+        args.method === "eth_getStorageAt" && down ? Promise.reject(new Error("blip")) : node.request(args),
+    };
+    await expect(stageSafeTx(hre, unsignedCall("0x01"))).rejects.toThrow(/blip/);
+    down = false;
+    expect(await stageSafeTx(hre, unsignedCall("0x02"))).toBe(true);
+  });
+
+  it("stages without that check, and says so, when the Safe service can't be read; a fork never asks", async () => {
+    const warn = vi.spyOn(console, "warn").mockImplementation(() => undefined);
+    vi.stubGlobal("fetch", () => Promise.reject(new TypeError("fetch failed")));
+    const hre = runtime(await tempRoot());
+    expect(await stageSafeTx(hre, unsignedCall("0x01"))).toBe(true);
+    expect(await stagedFilesThisRun(hre)).toHaveLength(1);
+    expect(warn).toHaveBeenCalledWith(
+      expect.stringMatching(/^Staging for Safe 0x\w+ without checking its pending proposals: .*fetch failed/),
+    );
+
+    const { fetch } = liveService();
+    const fork = runtime(await tempRoot(), { clientVersion: "anvil/v1.8.3" }, null, "localhost");
+    await stageSafeTx(fork, unsignedCall("0x01"));
+    expect(fetch).not.toHaveBeenCalled();
   });
 
   it("never replaces a live file another run started in the same second", async () => {
@@ -224,6 +316,31 @@ describe("proposeStagedSafeBatches", () => {
     expect(posted).toMatchObject([{ to: TARGET, data: "0x01", nonce: "40", sender: signer.address }]);
     expect(result).toMatchObject({ safe: SAFE, removed: true, status: { status: "fresh", proposal: { nonce: 40n } } });
     expect(await readdir(liveDir(root))).toEqual([]);
+    expect(await stagedFilesThisRun(hre)).toEqual([]);
+  });
+
+  it("warns when the proposal waits behind a nonce nobody proposed yet", async () => {
+    const log = quiet();
+    const hre = runtime(await tempRoot());
+    await stageSafeTx(hre, unsignedCall("0x01"));
+    liveService([serviceTx(40, [call("0x99")])]);
+    await proposeStagedSafeBatches(hre, options);
+    expect(String(log.mock.calls[0]?.[0])).toMatch(
+      /→ proposed at nonce 41 .*\n {2}! nonce 39 has no proposal yet; this one can't execute until it does\n/,
+    );
+  });
+
+  it("reads the API key from SAFE_API_KEY and takes a service URL per chain", async () => {
+    quiet();
+    vi.stubEnv("SAFE_API_KEY", "env-key");
+    const { fetch } = liveService();
+    const hre = runtime(await tempRoot());
+    const txServiceUrl = { 1: "https://one.example/api", 10: "https://ten.example/api" };
+    await stageSafeTx(hre, unsignedCall("0x01"), { txServiceUrl });
+    await proposeStagedSafeBatches(hre, { signer, txServiceUrl });
+    expect(fetch.mock.calls.map(c => c[0]).every(url => url.startsWith("https://one.example/api/"))).toBe(true);
+    const keys = fetch.mock.calls.map(c => (c[1] as { headers: Record<string, string> }).headers.Authorization);
+    expect(new Set(keys)).toEqual(new Set(["Bearer env-key"]));
   });
 
   it("deletes a file already pending or executed without proposing, but keeps one on a contested nonce", async () => {
@@ -235,6 +352,7 @@ describe("proposeStagedSafeBatches", () => {
     ] as const) {
       const root = await tempRoot();
       const hre = runtime(root);
+      liveService();
       await stageSafeTx(hre, unsignedCall("0x01"));
       const { posted } = liveService([...pending], [...executed]);
       const [result] = await proposeStagedSafeBatches(hre, options);
@@ -490,8 +608,8 @@ describe("safe:list", () => {
     await stageAt(STAGED_AT + 60_000, "0x02");
     await stageAt(STAGED_AT + 120_000, "0x03", "0x04");
     const { posted, fetch } = liveService(
-      [serviceTx(40, [call("0x03")])],
-      [serviceTx(39, [call("0x02")], { executed: true })],
+      [serviceTx(39, [call("0x03")])],
+      [serviceTx(38, [call("0x02")], { executed: true })],
     );
     const tasks = registeredTasks();
     await tasks.get("safe:list")?.({}, runtime(root));
@@ -500,13 +618,13 @@ describe("safe:list", () => {
     expect(log.mock.calls.map(c => String(c[0]))).toEqual([
       "safe-batches/mainnet  (3 staged)\n",
       expect.stringMatching(
-        /^20261001T153000Z-0x6649dd\.json {3}Safe 0x6649…AaEA {3}1 call\n {2}→ propose at nonce 41\n {2}! nonce 39 \(0x\w{4}…\w{4}\) changed these contracts since staging\n$/,
+        /^20261001T153000Z-0x6649dd\.json {3}Safe 0x6649…AaEA {3}1 call\n {2}→ propose at nonce 40\n {2}! nonce 38 \(0x\w{4}…\w{4}\) changed these contracts since staging\n$/,
       ),
       expect.stringMatching(
-        /^20261001T153100Z-0x6649dd\.json {3}Safe 0x6649…AaEA {3}1 call\n {2}✓ already executed at nonce 39 \(0x\w{4}…\w{4}\) → delete\n$/,
+        /^20261001T153100Z-0x6649dd\.json {3}Safe 0x6649…AaEA {3}1 call\n {2}✓ already executed at nonce 38 \(0x\w{4}…\w{4}\) → delete\n$/,
       ),
       expect.stringMatching(
-        /^20261001T153200Z-0x6649dd\.json {3}Safe 0x6649…AaEA {3}2 calls\n {2}✗ partial: shares calls with nonce 40 \(0x\w{4}…\w{4}\) → keep\n/,
+        /^20261001T153200Z-0x6649dd\.json {3}Safe 0x6649…AaEA {3}2 calls\n {2}✗ partial: shares calls with nonce 39 \(0x\w{4}…\w{4}\) → keep\n/,
       ),
     ]);
     expect(posted).toEqual([]);

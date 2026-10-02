@@ -1,4 +1,4 @@
-export { classifyAccount, readSafe, routeOwner } from "./account.js";
+export { classifyAccount, readSafe, resolveOwnerRoute } from "./account.js";
 export type { AccountInfo, OwnerRoute, RouteOptions, SafeInfo } from "./account.js";
 export { executeOnFork, rehearseSafeBatch } from "./fork.js";
 export type { ForkExecution, ForkOptions, RehearseOptions } from "./fork.js";

@@ -17,7 +17,7 @@ import {
   createSafeBatch,
   executeOnFork,
   rehearseSafeBatch,
-  routeOwner,
+  resolveOwnerRoute,
   validateSafeBatch,
   type SafeBatch,
   type Eip1193Provider,
@@ -100,23 +100,18 @@ describe.skipIf(!FORK_URL)("ethereum fork", () => {
     });
   });
 
-  describe("routeOwner", () => {
+  describe("resolveOwnerRoute", () => {
     it("routes owners through the Safe, never lets a Safe or contract act directly, and skips strangers", async () => {
       const info = await classifyAccount(anvil.provider, SAFE_141);
       if (info.kind !== "safe") throw new Error("expected a Safe");
       const signer = info.safe.owners[0] ?? STRANGER;
 
-      expect((await routeOwner(anvil.provider, SAFE_141, signer)).kind).toBe("safe");
-      expect(await routeOwner(anvil.provider, SAFE_141, SAFE_141)).toMatchObject({ kind: "skip" });
-      expect(await routeOwner(anvil.provider, USDC, USDC)).toMatchObject({ kind: "skip" });
-      expect((await routeOwner(anvil.provider, EIP7702_ACCOUNT, EIP7702_ACCOUNT)).kind).toBe("direct");
-      expect(await routeOwner(anvil.provider, SAFE_141, STRANGER)).toMatchObject({ kind: "skip" });
-      expect(await routeOwner(anvil.provider, EIP7702_ACCOUNT, STRANGER)).toMatchObject({ kind: "skip" });
-    });
-
-    it("accepts a delegate through the isProposer hook", async () => {
-      const route = await routeOwner(anvil.provider, SAFE_141, STRANGER, { isProposer: () => Promise.resolve(true) });
-      expect(route.kind).toBe("safe");
+      expect((await resolveOwnerRoute(anvil.provider, SAFE_141, signer)).kind).toBe("safe");
+      expect(await resolveOwnerRoute(anvil.provider, SAFE_141, SAFE_141)).toMatchObject({ kind: "skip" });
+      expect(await resolveOwnerRoute(anvil.provider, USDC, USDC)).toMatchObject({ kind: "skip" });
+      expect((await resolveOwnerRoute(anvil.provider, EIP7702_ACCOUNT, EIP7702_ACCOUNT)).kind).toBe("direct");
+      expect(await resolveOwnerRoute(anvil.provider, SAFE_141, STRANGER)).toMatchObject({ kind: "skip" });
+      expect(await resolveOwnerRoute(anvil.provider, EIP7702_ACCOUNT, STRANGER)).toMatchObject({ kind: "skip" });
     });
   });
 

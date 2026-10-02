@@ -53,6 +53,10 @@ export function verdict(result: ProposeSafeBatchResult, planned: boolean): strin
                     : "  wait for those to execute or reject them, then rerun the deploy, or discard this file",
                 ),
               ];
+  if (result.status === "fresh" && result.missingNonces.length > 0) {
+    const gaps = result.missingNonces.join(", ");
+    lines.push(yellow(`! nonce ${gaps} has no proposal yet; this one can't execute until it does`));
+  }
   for (const p of result.touched) lines.push(yellow(`! ${at(p)} changed these contracts since staging`));
   return lines;
 }

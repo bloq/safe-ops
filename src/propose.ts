@@ -25,6 +25,8 @@ import type { Eip1193Provider, SafeCall } from "./types.js";
 const CONFIG_SERVICE = "https://safe-config.safe.global/api/v1/chains";
 const MULTI_SEND_SELECTOR = toFunctionSelector("multiSend(bytes)");
 const REQUEST_TIMEOUT_MS = 30_000;
+// The service stores at most this many characters of `origin`, and rejects a longer one.
+const ORIGIN_MAX_LENGTH = 200;
 
 export interface TxServiceOptions {
   /** The service's API root, e.g. `https://api.safe.global/tx-service/eth/api`. Defaults to Safe's for the chain. */
@@ -43,11 +45,22 @@ export interface TxService {
 export async function resolveTxService(chainId: number, options: TxServiceOptions = {}): Promise<TxService> {
   let url = options.txServiceUrl;
   if (!url) {
-    const chain = await request<{ transactionService?: string }>(`${CONFIG_SERVICE}/${chainId}/`);
-    if (!chain.transactionService) throw new Error(`Safe has no transaction service for chain ${chainId}`);
+    const chain = await request<{ transactionService?: string }>(`${CONFIG_SERVICE}/${chainId}/`).catch(
+      (error: unknown): { transactionService?: string } => {
+        if (error instanceof RequestError && error.status === 404) return {};
+        throw error;
+      },
+    );
+    if (!chain.transactionService) {
+      throw new Error(`Safe has no transaction service for chain ${chainId}; pass txServiceUrl for another one`);
+    }
     url = `${chain.transactionService}/api`;
   }
   const service = { url: url.replace(/\/+$/, ""), chainId, ...(options.apiKey ? { apiKey: options.apiKey } : {}) };
+  // Safe requires a key there, and answers without one only at a fraction of the rate limit.
+  if (new URL(service.url).hostname === "api.safe.global" && !service.apiKey) {
+    throw new Error("api.safe.global needs an API key: pass apiKey (get one at developer.safe.global)");
+  }
   // A service for another chain would read another queue, where the same Safe address may have the same calls.
   const about = await request<{ chain_id?: number }>(`${service.url}/v1/about/ethereum-rpc/`, service);
   if (about.chain_id !== chainId) throw new Error(`${service.url} serves chain ${about.chain_id}, not ${chainId}`);
@@ -77,6 +90,8 @@ export interface SafeQueue {
   proposals: SafeProposal[];
   /** Nonces with more than one proposal: only one of them can execute. */
   contestedNonces: bigint[];
+  /** Nonces below `nextNonce` with no proposal: nothing after them can execute until they are used. */
+  missingNonces: bigint[];
 }
 
 interface ServiceTx {
@@ -102,19 +117,35 @@ export async function readSafeQueue(provider: Eip1193Provider, service: TxServic
     abi: safeAbi,
     functionName: "nonce",
   });
+  // Until the service indexes the latest execution, its proposal still reads as pending but sits below the on-chain
+  // nonce, so it is in neither list and its calls would look fresh: wait for the service instead.
+  if (onchainNonce > 0n) {
+    const latest = await readProposals(service, safe, `nonce=${onchainNonce - 1n}`);
+    if (latest.length > 0 && !latest.some(p => p.executed)) {
+      throw new Error(
+        `The Safe service has not indexed nonce ${onchainNonce - 1n} of Safe ${safe} yet; try again in a minute`,
+      );
+    }
+  }
   const proposals = await readProposals(service, safe, `executed=false&nonce__gte=${onchainNonce}`);
   const perNonce = new Map<bigint, number>();
   for (const { nonce } of proposals) perNonce.set(nonce, (perNonce.get(nonce) ?? 0) + 1);
   const nonces = [...perNonce.keys()];
+  const nextNonce = nonces.reduce((max, n) => (n >= max ? n + 1n : max), onchainNonce);
+  const missingNonces: bigint[] = [];
+  for (let n = onchainNonce; n < nextNonce; n++) if (!perNonce.has(n)) missingNonces.push(n);
   return {
     onchainNonce,
-    nextNonce: nonces.reduce((max, n) => (n >= max ? n + 1n : max), onchainNonce),
+    nextNonce,
     proposals,
     contestedNonces: nonces.filter(n => (perNonce.get(n) ?? 0) > 1),
+    missingNonces,
   };
 }
 
-// Pages through every match: api-kit's getNextNonce reads only the first page.
+// Pages through every match: api-kit's getNextNonce reads only the first page. The service lists only trusted
+// proposals by default, as the Safe UI does: unsigned ones posted by strangers are left out, and every execution is
+// trusted.
 async function readProposals(service: TxService, safe: Address, filter: string): Promise<SafeProposal[]> {
   const txs: ServiceTx[] = [];
   let url: string | null =
@@ -122,7 +153,7 @@ async function readProposals(service: TxService, safe: Address, filter: string):
   while (url) {
     const page: { next: string | null; results: ServiceTx[] } = await request(url, service);
     txs.push(...page.results);
-    url = page.next;
+    url = nextPage(page.next, service);
   }
   return txs.map(tx => {
     const data = tx.data ?? "0x";
@@ -161,6 +192,8 @@ export interface SafeBatchStatus {
   touched: SafeProposal[];
   /** Where a proposal of the batch would go: after every pending one. */
   nextNonce: bigint;
+  /** Nonces below `nextNonce` with no proposal, which a proposal at `nextNonce` would wait for. */
+  missingNonces: bigint[];
 }
 
 // Executions shortly before `createdAt` count too, in case the staging machine's clock runs ahead.
@@ -205,16 +238,45 @@ export async function safeBatchStatus(
     overlapping,
     touched: executed.filter(p => p !== match && !shares(p) && p.calls.some(c => targets.has(c.to))),
     nextNonce: queue.nextNonce,
+    missingNonces: queue.missingNonces,
   };
 }
 
-/** Whether `account` is a proposer (delegate) for `safe`, including one registered for all of a delegator's Safes. */
-export async function isProposer(service: TxService, safe: Address, account: Address): Promise<boolean> {
-  const { results } = await request<{ results: { safe: string | null }[] }>(
-    `${service.url}/v2/delegates/?delegate=${getAddress(account)}&limit=100`,
-    service,
-  );
-  return results.some(d => d.safe === null || isAddressEqual(getAddress(d.safe), safe));
+interface Delegate {
+  safe: string | null;
+  delegator: string;
+  expiryDate: string | null;
+}
+
+/**
+ * Whether `account` is a proposer for `safe`: a delegate, listed under Proposers in the Safe UI's settings, for this
+ * Safe or for all of its delegator's Safes. Owners propose without being one. Counted as the service does: the
+ * delegator must still be an owner, and the delegation must not have expired. `safe` is its address, or what
+ * `readSafe` returned, to skip reading its owners again.
+ */
+export async function isProposer(
+  provider: Eip1193Provider,
+  service: TxService,
+  safe: Address | { address: Address; owners: readonly Address[] },
+  account: Address,
+): Promise<boolean> {
+  if (typeof safe === "string") {
+    const info = await readSafe(provider, getAddress(safe));
+    if (!info) throw new Error(`${safe} is not a Safe`);
+    safe = info;
+  }
+  const now = Date.now();
+  const counts = (d: Delegate) =>
+    (d.safe === null || isAddressEqual(getAddress(d.safe), safe.address)) &&
+    safe.owners.some(o => isAddressEqual(o, getAddress(d.delegator))) &&
+    (d.expiryDate === null || Date.parse(d.expiryDate) > now);
+  let url: string | null = `${service.url}/v2/delegates/?delegate=${getAddress(account)}&limit=100`;
+  while (url) {
+    const page: { next: string | null; results: Delegate[] } = await request(url, service);
+    if (page.results.some(counts)) return true;
+    url = nextPage(page.next, service);
+  }
+  return false;
 }
 
 /**
@@ -229,8 +291,10 @@ export interface ProposalSigner {
 
 export interface ProposeOptions {
   nonce: bigint;
-  /** Shown by the Safe UI as the proposal's origin. */
+  /** The app the Safe UI names as the proposal's origin. Defaults to `safe-ops`. */
   origin?: string;
+  /** A note the Safe UI shows signers with the proposal, cut to fit the service's 200 characters for both. */
+  note?: string;
 }
 
 export interface Proposal {
@@ -241,8 +305,10 @@ export interface Proposal {
 }
 
 export interface ProposeSafeBatchOptions {
-  /** Shown by the Safe UI as the proposal's origin. */
+  /** The app the Safe UI names as the proposal's origin. Defaults to `safe-ops`. */
   origin?: string;
+  /** A note the Safe UI shows signers with the proposal. Defaults to the batch's description, or else its name. */
+  note?: string;
   /** Allow calls with calldata to addresses without code, which otherwise refuse the proposal. */
   allowCallsWithoutCode?: boolean;
 }
@@ -274,6 +340,7 @@ export async function proposeSafeBatch(
   const proposal = await proposeCalls(provider, service, signer, batchSafe(batch), calls, {
     nonce: status.nextNonce,
     ...(options.origin === undefined ? {} : { origin: options.origin }),
+    note: options.note ?? batch.meta.description ?? batch.meta.name,
   });
   return { ...status, proposal };
 }
@@ -298,6 +365,10 @@ export async function proposeCalls(
   if (chainId !== service.chainId) throw new Error(`Node is on chain ${chainId}, service on ${service.chainId}`);
   const info = await readSafe(provider, getAddress(safe));
   if (!info) throw new Error(`${safe} is not a Safe`);
+  // Below 1.3.0, a call that fails without safeTxGas still uses up the nonce, and 1.0.0 can't check eth_sign.
+  if (/^1\.[0-2]\./.test(info.version)) {
+    throw new Error(`Safe ${info.address} is ${info.version}; proposing needs 1.3.0 or later`);
+  }
 
   const [to, value, data, operation] = await safeTxFields(provider, info.version, calls.map(normalizeCall));
   const { nonce } = options;
@@ -333,16 +404,44 @@ export async function proposeCalls(
     contractTransactionHash: safeTxHash,
     sender: proposer,
     signature,
-    ...(options.origin === undefined ? {} : { origin: options.origin }),
+    origin: originOf(options.origin ?? "safe-ops", options.note),
   });
   return { safe: info.address, safeTxHash, nonce, proposer };
+}
+
+// A page link elsewhere (e.g. http behind a proxy) would carry the API key off the service.
+function nextPage(next: string | null, service: TxService): string | null {
+  if (next !== null && new URL(next).origin !== new URL(service.url).origin) {
+    throw new Error(`${service.url} links its next page to another origin: ${next}`);
+  }
+  return next;
+}
+
+// The Safe UI reads `origin` only as JSON with string `name`, `url` and `note`; a plain string shows nothing.
+function originOf(name: string, note: string | undefined): string {
+  // Cut by code point: half an emoji is not valid text.
+  const head = (text: string, n: number) => Array.from(text).slice(0, n).join("");
+  const json = (text?: string) => JSON.stringify({ name: head(name, 50), ...(text ? { note: text } : {}) });
+  if (!note || json(note).length <= ORIGIN_MAX_LENGTH) return json(note);
+  let length = Array.from(note).length;
+  while (length > 0 && json(`${head(note, length)}…`).length > ORIGIN_MAX_LENGTH) length--;
+  return json(length > 0 ? `${head(note, length)}…` : undefined);
+}
+
+class RequestError extends Error {
+  constructor(
+    message: string,
+    readonly status?: number,
+  ) {
+    super(message);
+  }
 }
 
 async function request<T>(url: string, service?: { apiKey?: string }, body?: unknown): Promise<T> {
   const method = body === undefined ? "GET" : "POST";
   // A POST that failed in transit or at a gateway may have been stored; a 4xx means the service refused it.
   const mayHaveLanded = method === "POST" ? "; it may still have landed, and a rerun skips what is already queued" : "";
-  let ok: boolean, status: number, text: string;
+  let ok: boolean, status: number, text: string, location: string | null | undefined;
   try {
     const response = await fetch(url, {
       method,
@@ -352,17 +451,23 @@ async function request<T>(url: string, service?: { apiKey?: string }, body?: unk
         ...(service?.apiKey ? { Authorization: `Bearer ${service.apiKey}` } : {}),
       },
       ...(body === undefined ? {} : { body: JSON.stringify(body) }),
+      // A redirect to another host drops the Authorization header, so the key would silently stop counting.
+      redirect: "manual",
       // A hung service must not hang the deploy. Covers reading the body too.
       signal: AbortSignal.timeout(REQUEST_TIMEOUT_MS),
     });
     ({ ok, status } = response);
+    if (status >= 300 && status < 400) location = response.headers.get("location");
     text = await response.text();
   } catch (error) {
     throw new Error(`${method} ${url} failed: ${describeError(error)}${mayHaveLanded}`, { cause: error });
   }
+  if (status >= 300 && status < 400) {
+    throw new RequestError(`${method} ${url} redirects to ${location ?? "another URL"}; use that URL instead`, status);
+  }
   if (!ok) {
     const hint = status >= 500 ? mayHaveLanded : "";
-    throw new Error(`${method} ${url} answered ${status}: ${text.slice(0, 500)}${hint}`);
+    throw new RequestError(`${method} ${url} answered ${status}: ${text.slice(0, 500)}${hint}`, status);
   }
   return (text ? JSON.parse(text) : undefined) as T;
 }

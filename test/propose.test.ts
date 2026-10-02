@@ -21,6 +21,7 @@ import {
   readSafeQueue,
   resolveTxService,
   safeBatchStatus,
+  type Eip1193Provider,
   type SafeCall,
 } from "../src/index.js";
 import { proposeCalls } from "../src/propose.js";
@@ -43,8 +44,12 @@ interface Sent {
   signal?: unknown;
 }
 
-/** Stubs fetch with `answer(url)` and records every request. */
-function service(answer: (url: string) => unknown, status = 200): Sent[] {
+// The service's answer to "is the Safe's latest execution indexed?", which every queue read asks first.
+const INDEXED = `?nonce=${SAFE_NONCE - 1n}&`;
+const latestTx = (executed: boolean) => serviceTx(Number(SAFE_NONCE - 1n), [update(0)], { executed });
+
+/** Stubs fetch with `answer(url)` and records every request. The latest execution is indexed unless `lagging`. */
+function service(answer: (url: string) => unknown, status = 200, { lagging = false } = {}): Sent[] {
   const sent: Sent[] = [];
   vi.stubGlobal(
     "fetch",
@@ -56,7 +61,8 @@ function service(answer: (url: string) => unknown, status = 200): Sent[] {
         signal: init.signal,
         ...(init.body ? { body: JSON.parse(init.body) as Record<string, unknown> } : {}),
       });
-      const text = JSON.stringify(answer(url) ?? {});
+      const indexed = url.includes(INDEXED) ? { next: null, results: [latestTx(!lagging)] } : undefined;
+      const text = JSON.stringify(indexed ?? answer(url) ?? {});
       return Promise.resolve({ ok: status < 300, status, text: () => Promise.resolve(text) });
     },
   );
@@ -86,6 +92,36 @@ describe("resolveTxService", () => {
     ]);
   });
 
+  it("says when Safe has no service for the chain, and asks for a key for api.safe.global", async () => {
+    service(() => ({ detail: "Not found." }), 404);
+    await expect(resolveTxService(743111)).rejects.toThrow(
+      "Safe has no transaction service for chain 743111; pass txServiceUrl",
+    );
+    const sent = service(() => ({ transactionService: "https://api.safe.global/tx-service/eth" }));
+    await expect(resolveTxService(1)).rejects.toThrow("api.safe.global needs an API key");
+    expect(sent).toHaveLength(1);
+  });
+
+  it("refuses to follow a redirect, which would drop the API key", async () => {
+    const redirects: unknown[] = [];
+    vi.stubGlobal("fetch", (_url: string, init: { redirect?: string }) => {
+      redirects.push(init.redirect);
+      return Promise.resolve({
+        ok: false,
+        status: 308,
+        headers: new Headers({ location: "https://api.safe.global/tx-service/hemi/api/v1/about/ethereum-rpc/" }),
+        text: () => Promise.resolve(""),
+      });
+    });
+    await expect(
+      resolveTxService(43111, { txServiceUrl: "https://safe-transaction-hemi.safe.global/api" }),
+    ).rejects.toThrow(
+      "redirects to https://api.safe.global/tx-service/hemi/api/v1/about/ethereum-rpc/; use that URL instead",
+    );
+    // Without `manual`, fetch would follow it and send the request on without the key.
+    expect(redirects).toEqual(["manual"]);
+  });
+
   it("uses an explicit URL without a lookup, but refuses one for another chain", async () => {
     service(() => ({ chain_id: 1 }));
     expect((await resolveTxService(1, { txServiceUrl: "https://tx.example/api/" })).url).toBe("https://tx.example/api");
@@ -107,12 +143,19 @@ describe("readSafeQueue", () => {
     const sent = service(url => pages[url] ?? pages.first);
     const queue = await readSafeQueue(safeProvider(), SERVICE, SAFE);
 
-    expect(sent[0]?.url).toBe(
+    expect(sent.map(r => r.url).slice(0, 2)).toEqual([
+      `https://tx.example/api/v2/safes/${SAFE}/multisig-transactions/` +
+        `?nonce=${SAFE_NONCE - 1n}&ordering=nonce&limit=100`,
       `https://tx.example/api/v2/safes/${SAFE}/multisig-transactions/` +
         `?executed=false&nonce__gte=${SAFE_NONCE}&ordering=nonce&limit=100`,
-    );
+    ]);
     expect(sent[0]?.headers.Authorization).toBe("Bearer key");
-    expect(queue).toMatchObject({ onchainNonce: SAFE_NONCE, nextNonce: 42n, contestedNonces: [41n] });
+    expect(queue).toMatchObject({
+      onchainNonce: SAFE_NONCE,
+      nextNonce: 42n,
+      contestedNonces: [41n],
+      missingNonces: [40n],
+    });
     expect(queue.proposals.map(p => [p.nonce, p.calls])).toEqual([
       [39n, [update(1), { to: Y, data: "0x01", value: 0n }]],
       [41n, [{ to: X, data: "0x", value: 5n }]],
@@ -120,8 +163,38 @@ describe("readSafeQueue", () => {
     ]);
   });
 
+  it("refuses a next page on another origin, which would carry the API key off the service", async () => {
+    service(url =>
+      url.includes("executed=false")
+        ? { next: "http://tx.example/api/page2", results: [] }
+        : { next: null, results: [] },
+    );
+    await expect(readSafeQueue(safeProvider(), SERVICE, SAFE)).rejects.toThrow(
+      "links its next page to another origin: http://tx.example/api/page2",
+    );
+  });
+
   it("proposes at the on-chain nonce when nothing is queued", async () => {
     service(() => ({ next: null, results: [] }));
+    expect((await readSafeQueue(safeProvider(), SERVICE, SAFE)).nextNonce).toBe(SAFE_NONCE);
+  });
+
+  it("waits for the service to index the Safe's latest execution, which would otherwise look fresh", async () => {
+    // Just executed on chain: the nonce moved past the proposal, which the service still lists as pending.
+    const sent = service(() => ({ next: null, results: [] }), 200, { lagging: true });
+    await expect(readSafeQueue(safeProvider(), SERVICE, SAFE)).rejects.toThrow(
+      `has not indexed nonce ${SAFE_NONCE - 1n} of Safe ${SAFE} yet`,
+    );
+    expect(sent).toHaveLength(1);
+    // A Safe that never executed anything has nothing to wait for.
+    const fresh = service(() => ({ next: null, results: [] }), 200, { lagging: true });
+    const queue = await readSafeQueue(safeProvider({ nonce: 0n }), SERVICE, SAFE);
+    expect(queue.nextNonce).toBe(0n);
+    expect(fresh.map(r => r.url).join()).not.toContain("?nonce=");
+    // Nor does a service that never recorded that nonce (e.g. indexing started later): it would wait forever.
+    vi.stubGlobal("fetch", () =>
+      Promise.resolve({ ok: true, status: 200, text: () => Promise.resolve('{"next":null,"results":[]}') }),
+    );
     expect((await readSafeQueue(safeProvider(), SERVICE, SAFE)).nextNonce).toBe(SAFE_NONCE);
   });
 });
@@ -137,9 +210,16 @@ describe("safeBatchStatus", () => {
 
   it("is fresh when nothing pending or executed shares its calls, and reads executions since staging", async () => {
     const { result, sent } = await status([], [], update(1));
-    expect(result).toEqual({ status: "fresh", contested: false, overlapping: [], touched: [], nextNonce: SAFE_NONCE });
+    expect(result).toEqual({
+      status: "fresh",
+      contested: false,
+      overlapping: [],
+      touched: [],
+      nextNonce: SAFE_NONCE,
+      missingNonces: [],
+    });
     // Ten minutes before staging, in case the staging machine's clock runs ahead.
-    expect(sent[1]?.url).toContain("executed=true&execution_date__gte=2026-10-01T15:20:00.000Z");
+    expect(sent.map(r => r.url).join()).toContain("executed=true&execution_date__gte=2026-10-01T15:20:00.000Z");
   });
 
   it("is pending when one proposal makes exactly its calls, and flags a contested nonce", async () => {
@@ -195,6 +275,18 @@ describe("safeBatchStatus", () => {
 describe("proposeSafeBatch", () => {
   const batch = createSafeBatch({ chainId: 1, safe: SAFE, calls: [update(1)], name: "Deploy", createdAt: 1 });
 
+  it("notes the batch's description, or else its name, for signers", async () => {
+    const sent = service(() => ({ next: null, results: [] }));
+    await proposeSafeBatch(safeProvider(), SERVICE, signer, batch);
+    const described = createSafeBatch({ chainId: 1, safe: SAFE, calls: [update(2)], name: "N", description: "D" });
+    await proposeSafeBatch(safeProvider(), SERVICE, signer, described, { origin: "app" });
+    const origins = sent.filter(r => r.method === "POST").map(r => JSON.parse(r.body?.origin as string) as unknown);
+    expect(origins).toEqual([
+      { name: "safe-ops", note: "Deploy" },
+      { name: "app", note: "D" },
+    ]);
+  });
+
   it("proposes a fresh batch exactly as written, after the pending proposals", async () => {
     const sent = service(url => ({
       next: null,
@@ -231,14 +323,54 @@ describe("proposeSafeBatch", () => {
 });
 
 describe("isProposer", () => {
+  const OWNER: Address = "0x9520b477Aa81180E6DdC006Fc09Fb6d3eb4e807A";
+  const safe = { address: SAFE, owners: [OWNER] } as const;
+  // Given what readSafe returned, it never reads the chain again.
+  const noNode: Eip1193Provider = { request: () => Promise.reject(new Error("unexpected node request")) };
+  const delegate = (d: { safe?: string | null; delegator?: string; expiryDate?: string | null }) => ({
+    safe: SAFE,
+    delegator: OWNER,
+    expiryDate: null,
+    ...d,
+  });
+
   it("accepts a delegate for this Safe or for all of its delegator's Safes, and nothing else", async () => {
-    service(() => ({ results: [{ safe: Y }] }));
-    expect(await isProposer(SERVICE, SAFE, X)).toBe(false);
-    service(() => ({ results: [{ safe: Y }, { safe: SAFE.toLowerCase() }] }));
-    expect(await isProposer(SERVICE, SAFE, X)).toBe(true);
-    const sent = service(() => ({ results: [{ safe: null }] }));
-    expect(await isProposer(SERVICE, SAFE, X)).toBe(true);
+    service(() => ({ next: null, results: [delegate({ safe: Y })] }));
+    expect(await isProposer(noNode, SERVICE, safe, X)).toBe(false);
+    service(() => ({ next: null, results: [delegate({ safe: Y }), delegate({ safe: SAFE.toLowerCase() })] }));
+    expect(await isProposer(noNode, SERVICE, safe, X)).toBe(true);
+    const sent = service(() => ({ next: null, results: [delegate({ safe: null })] }));
+    expect(await isProposer(noNode, SERVICE, safe, X)).toBe(true);
     expect(sent[0]?.url).toBe(`https://tx.example/api/v2/delegates/?delegate=${X}&limit=100`);
+  });
+
+  it("ignores delegations the service would refuse: by a former owner, or expired", async () => {
+    service(() => ({ next: null, results: [delegate({ delegator: Y })] }));
+    expect(await isProposer(noNode, SERVICE, safe, X)).toBe(false);
+    service(() => ({ next: null, results: [delegate({ expiryDate: "2020-01-01T00:00:00Z" })] }));
+    expect(await isProposer(noNode, SERVICE, safe, X)).toBe(false);
+    service(() => ({ next: null, results: [delegate({ expiryDate: "2999-01-01T00:00:00Z" })] }));
+    expect(await isProposer(noNode, SERVICE, safe, X)).toBe(true);
+  });
+
+  it("reads every page of delegations", async () => {
+    const sent = service(url =>
+      url.includes("page2")
+        ? { next: null, results: [delegate({})] }
+        : { next: "https://tx.example/api/page2", results: [delegate({ safe: Y })] },
+    );
+    expect(await isProposer(noNode, SERVICE, safe, X)).toBe(true);
+    expect(sent).toHaveLength(2);
+  });
+});
+
+describe("isProposer by address", () => {
+  it("reads the Safe's owners from the chain, and refuses an address that is not a Safe", async () => {
+    // The mock Safe is owned by OWNER, who delegated to X.
+    const OWNER = "0x9520b477Aa81180E6DdC006Fc09Fb6d3eb4e807A";
+    service(() => ({ next: null, results: [{ safe: SAFE, delegator: OWNER, expiryDate: null }] }));
+    expect(await isProposer(safeProvider(), SERVICE, SAFE, X)).toBe(true);
+    await expect(isProposer(safeProvider({ slot0: X }), SERVICE, SAFE, X)).rejects.toThrow(`${SAFE} is not a Safe`);
   });
 });
 
@@ -273,7 +405,7 @@ describe("proposeCalls", () => {
       nonce: "42",
       contractTransactionHash: safeTxHash,
       sender: signer.address,
-      origin: "deploy",
+      origin: JSON.stringify({ name: "deploy" }),
     });
 
     const signature = post?.body?.signature as Hex;
@@ -308,6 +440,40 @@ describe("proposeCalls", () => {
       /does not recover to its address/,
     );
     expect(sent).toHaveLength(2);
+  });
+
+  it("posts origin as the JSON the Safe UI reads, with a note cut to the service's 200 characters", async () => {
+    const sent = service(() => ({}));
+    await proposeCalls(safeProvider(), SERVICE, signer, SAFE, [update(1)], { nonce: 1n });
+    expect(sent[0]?.body?.origin).toBe(JSON.stringify({ name: "safe-ops" }));
+    await proposeCalls(safeProvider(), SERVICE, signer, SAFE, [update(1)], { nonce: 1n, note: 'Deploy "x"' });
+    expect(JSON.parse(sent[1]?.body?.origin as string)).toEqual({ name: "safe-ops", note: 'Deploy "x"' });
+    await proposeCalls(safeProvider(), SERVICE, signer, SAFE, [update(1)], { nonce: 1n, note: '"'.repeat(300) });
+    const origin = sent[2]?.body?.origin as string;
+    expect(origin.length).toBeLessThanOrEqual(200);
+    expect(origin.length).toBeGreaterThan(190);
+    expect((JSON.parse(origin) as { note: string }).note).toMatch(/^"+…$/);
+    // Cut between characters, never inside one: half an emoji is not valid text.
+    await proposeCalls(safeProvider(), SERVICE, signer, SAFE, [update(1)], { nonce: 1n, note: "😀".repeat(200) });
+    const emoji = sent[3]?.body?.origin as string;
+    expect(emoji.length).toBeLessThanOrEqual(200);
+    expect((JSON.parse(emoji) as { note: string }).note).toMatch(/^(😀)+…$/u);
+    // The app name is cut to 50 characters, also between characters, so it always leaves room within 200.
+    await proposeCalls(safeProvider(), SERVICE, signer, SAFE, [update(1)], {
+      nonce: 1n,
+      origin: `a${"😀".repeat(60)}`,
+    });
+    expect((JSON.parse(sent[4]?.body?.origin as string) as { name: string }).name).toBe(`a${"😀".repeat(49)}`);
+  });
+
+  it("refuses Safes before 1.3.0, where a failing call still uses up the nonce", async () => {
+    const sent = service(() => ({}));
+    for (const version of ["1.1.1", "1.2.0", "1.0.0"]) {
+      await expect(
+        proposeCalls(safeProvider({ version }), SERVICE, signer, SAFE, [update(1)], { nonce: 1n }),
+      ).rejects.toThrow(`is ${version}; proposing needs 1.3.0 or later`);
+    }
+    expect(sent).toEqual([]);
   });
 
   it("refuses a local node, whose state would be proposed to the real queue", async () => {

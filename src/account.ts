@@ -2,6 +2,7 @@ import { getSafeL2SingletonDeployments, getSafeSingletonDeployments } from "@saf
 import { getAddress, isAddressEqual, size, sliceHex, type Address } from "viem";
 import { safeAbi } from "./abi.js";
 import { publicClientFor } from "./client.js";
+import { isProposer, type TxService } from "./propose.js";
 import type { Eip1193Provider } from "./types.js";
 
 const EIP7702_PREFIX = "0xef0100";
@@ -73,11 +74,12 @@ export type OwnerRoute =
   | { kind: "skip"; owner: Address; reason: string };
 
 export interface RouteOptions {
-  isProposer?: (safe: Address, caller: Address) => Promise<boolean>;
+  /** The Safe's transaction service, to also route a caller that is a proposer (delegate) of the Safe. */
+  service?: TxService;
 }
 
 /** Decides how `caller` can act for `owner`: sign directly, go through the owner's Safe, or not at all. */
-export async function routeOwner(
+export async function resolveOwnerRoute(
   provider: Eip1193Provider,
   owner: Address,
   caller: Address,
@@ -93,8 +95,15 @@ export async function routeOwner(
       const { safe } = account;
       if (isCaller) return { kind: "skip", owner: address, reason: `Safe ${address} can't sign for itself` };
       if (safe.owners.some(o => isAddressEqual(o, caller))) return { kind: "safe", owner: address, safe };
-      if (await options.isProposer?.(address, caller)) return { kind: "safe", owner: address, safe };
-      return { kind: "skip", owner: address, reason: `${caller} is not an owner or delegate of Safe ${address}` };
+      if (!options.service) {
+        return {
+          kind: "skip",
+          owner: address,
+          reason: `${caller} is not an owner of Safe ${address} (pass service to check its proposers)`,
+        };
+      }
+      if (await isProposer(provider, options.service, safe, caller)) return { kind: "safe", owner: address, safe };
+      return { kind: "skip", owner: address, reason: `${caller} is not an owner or proposer of Safe ${address}` };
     }
     case "eoa":
       if (isCaller) return { kind: "direct", owner: address };

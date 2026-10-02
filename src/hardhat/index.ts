@@ -4,16 +4,18 @@ import { createInterface } from "node:readline/promises";
 import { getAddress, http, isAddress, isHex, type Address } from "viem";
 import { readSafe } from "../account.js";
 import { CallQueue, type AddOptions } from "../batch.js";
+import { sameCall } from "../call.js";
 import { describeError, localNodeVersion, publicClientFor } from "../client.js";
 import { rehearseSafeBatch, type ForkExecution } from "../fork.js";
 import {
   proposeSafeBatch,
+  readSafeQueue,
   resolveTxService,
   safeBatchStatus,
   type TxService,
   type ProposalSigner,
   type ProposeSafeBatchResult,
-  type TxServiceOptions,
+  type SafeProposal,
 } from "../propose.js";
 import { batchSafe, createSafeBatch, validateSafeBatch, type SafeBatch } from "../tx-builder.js";
 import { kept, printFile, printFolder, refused, rehearsed, verdict } from "./output.js";
@@ -44,8 +46,26 @@ export interface HardhatDeployRuntime {
   getNamedAccounts?(): Promise<Record<string, string>>;
 }
 
-// Shown in the Safe UI and excluded from the checksum; the Transaction Builder ignores chainId and Safe on import.
+// Shown in the Safe UI and excluded from the checksum. The Transaction Builder still imports a fork file (on another
+// chain it only warns), so the marker is what tells signers not to sign it.
 const FORK_MARKER = "FORK REHEARSAL, DO NOT SIGN: ";
+
+/** Which Safe Transaction Service to use, for staging, proposing and the tasks. */
+export interface SafeServiceOptions {
+  /** Defaults to the `SAFE_API_KEY` environment variable; api.safe.global requires one. */
+  apiKey?: string;
+  /** A service instead of Safe's own for the chain: one URL, or URLs by chain id (e.g. for chains Safe doesn't serve). */
+  txServiceUrl?: string | Record<number, string>;
+}
+
+function serviceFor(chainId: number, options: SafeServiceOptions): Promise<TxService> {
+  const apiKey = options.apiKey ?? process.env.SAFE_API_KEY;
+  const { txServiceUrl } = options;
+  const url = typeof txServiceUrl === "string" ? txServiceUrl : txServiceUrl?.[chainId];
+  return resolveTxService(chainId, { ...(apiKey ? { apiKey } : {}), ...(url ? { txServiceUrl: url } : {}) });
+}
+
+export interface StageOptions extends AddOptions, SafeServiceOptions {}
 
 interface StagingRun {
   chainId: number;
@@ -54,6 +74,8 @@ interface StagingRun {
   createdAt: number;
   queue: CallQueue;
   files: Map<Address, string>;
+  /** Per Safe, checked to be one on first sight: its plain pending proposals on uncontested nonces (none on a fork). */
+  safes: Map<Address, Promise<SafeProposal[]>>;
   /** Staging steps run one at a time, so concurrent calls can't race on a file. */
   steps: Promise<unknown>;
 }
@@ -65,12 +87,14 @@ const runs = new WeakMap<HardhatDeployRuntime, Promise<StagingRun>>();
  * when hardhat-deploy can sign for `from`, and is staged when it can't. Or pass what `catchUnknownSigner` returned
  * (`null` stages nothing). Each run stages into one file per Safe, written after every call:
  * `safe-batches/<network>/<timestamp>-<safe>.json` (on a local node, `<safe>.json`, marked as a fork rehearsal).
- * Returns true when the transaction is left to the Safe, including when the same call is already staged.
+ * On a live network, a call already pending for the Safe is skipped, so the file holds only what is left to propose.
+ * Returns true when the transaction is left to the Safe, including when the same call is already staged or pending.
+ * The service options are read on the first call for each Safe.
  */
 export async function stageSafeTx(
   hre: HardhatDeployRuntime,
   txOrAction: UnknownSignerTx | null | Promise<unknown> | (() => Promise<unknown>),
-  options: AddOptions = {},
+  options: StageOptions = {},
 ): Promise<boolean> {
   const tx =
     typeof txOrAction === "function" || txOrAction instanceof Promise
@@ -93,11 +117,27 @@ async function stage(
   run: StagingRun,
   safe: Address,
   call: Required<SafeCall>,
-  options: AddOptions,
+  options: StageOptions,
 ): Promise<boolean> {
-  const { chainId, local, dir, createdAt, queue, files } = run;
+  const { chainId, local, dir, createdAt, queue, files, safes } = run;
+  let pending = safes.get(safe);
+  if (!pending) {
+    pending = pendingProposals(hre, run, safe, options);
+    safes.set(safe, pending);
+    // A failed check (e.g. an RPC blip) is retried by the next call.
+    pending.catch(() => safes.delete(safe));
+  }
+  const proposals = await pending;
   const first = !files.has(safe);
-  if (first && !(await readSafe(hre.network.provider, safe))) throw new Error(`Owner ${safe} is not a Safe`);
+  // A deploy script regenerates calls it can't see queued; proposing them again would make the batch revert or repeat.
+  // Pending proposals execute before this file, so only calls staged before anything else for the Safe can be left to
+  // them: a later one would run ahead of calls the script made first. Those are kept, and the file reads as partial.
+  const queued =
+    first && !options.allowDuplicate ? proposals.find(p => p.calls.some(c => sameCall(c, call))) : undefined;
+  if (queued) {
+    console.warn(`Skipped a call from ${safe} to ${call.to}: it is already pending at nonce ${queued.nonce}`);
+    return true;
+  }
   if (!queue.add(safe, call, options)) {
     console.warn(`Skipped a call from ${safe} to ${call.to}: the same call is already staged for that contract`);
     return true;
@@ -117,6 +157,25 @@ async function stage(
   // A live run never replaces a file it didn't start; a local run replaces its previous rehearsal file.
   await writeFile(file, `${JSON.stringify(batch, null, 2)}\n`, { flag: first && !local ? "wx" : "w" });
   return true;
+}
+
+async function pendingProposals(
+  hre: HardhatDeployRuntime,
+  run: StagingRun,
+  safe: Address,
+  options: SafeServiceOptions,
+): Promise<SafeProposal[]> {
+  if (!(await readSafe(hre.network.provider, safe))) throw new Error(`Owner ${safe} is not a Safe`);
+  if (run.local) return [];
+  try {
+    const queue = await readSafeQueue(hre.network.provider, await serviceFor(run.chainId, options), safe);
+    // Only a proposal that runs its calls as a batch would can stand in for them, as in safeBatchStatus.
+    return queue.proposals.filter(p => p.plain && !queue.contestedNonces.includes(p.nonce));
+  } catch (error) {
+    // Staging goes on without the check: a file that overlaps pending proposals is kept as partial, never proposed.
+    console.warn(`Staging for Safe ${safe} without checking its pending proposals: ${describeError(error)}`);
+    return [];
+  }
 }
 
 function stagingRun(hre: HardhatDeployRuntime): Promise<StagingRun> {
@@ -140,6 +199,7 @@ async function startRun(hre: HardhatDeployRuntime): Promise<StagingRun> {
     createdAt: Date.now(),
     queue: new CallQueue(),
     files: new Map(),
+    safes: new Map(),
     steps: Promise.resolve(),
   };
 }
@@ -197,11 +257,12 @@ async function warnIfSentBySafe(hre: HardhatDeployRuntime, result: unknown): Pro
   );
 }
 
-export interface ProposeStagedOptions extends TxServiceOptions {
+export interface ProposeStagedOptions extends SafeServiceOptions {
   /** An owner or proposer of the Safes. Defaults to Hardhat's `deployer` account, signing with `personal_sign`. */
   signer?: ProposalSigner;
   /** Staged files to handle. Defaults to this run's files, or every staged file for the network if none. */
   files?: string[];
+  /** The app the Safe UI names as each proposal's origin. Defaults to `safe-ops`. */
   origin?: string;
   allowCallsWithoutCode?: boolean;
   /**
@@ -284,7 +345,7 @@ export async function proposeStagedSafeBatches(
   }
 
   if (files.length === 0) return results;
-  const service = await resolveTxService(await publicClientFor(provider).getChainId(), options);
+  const service = await serviceFor(await publicClientFor(provider).getChainId(), options);
   // The deploy that just staged a file is the decision to propose it; anything else is shown first and confirmed.
   // Files from a plan: only those it counted to propose or delete are acted on, whatever changed since.
   const approved = files.some(f => !ours.includes(f)) ? await approve(hre, service, files, options) : undefined;
@@ -395,7 +456,12 @@ function shouldDelete(result: ProposeSafeBatchResult): boolean {
 // What proposeStagedSafeBatches would do with a batch, without proposing or deleting anything.
 async function predict(provider: Eip1193Provider, service: TxService, batch: SafeBatch): Promise<string[]> {
   const refusal = refusalOf(batch, service);
-  return refusal ? refused(refusal) : verdict(await safeBatchStatus(provider, service, batch), true);
+  if (refusal) return refused(refusal);
+  // One file the service can't answer for (e.g. still indexing its Safe) doesn't hide the others.
+  return safeBatchStatus(provider, service, batch).then(
+    status => verdict(status, true),
+    (error: unknown) => refused(describeError(error)),
+  );
 }
 
 export interface StagedSafeBatch {
@@ -410,6 +476,16 @@ export async function listStagedSafeBatches(
 ): Promise<StagedSafeBatch[]> {
   const files = await listStagedFiles(hre, network);
   return Promise.all(files.map(async file => ({ file, batch: await readSafeBatch(file) })));
+}
+
+/**
+ * The files this run has staged so far, e.g. to record them or to stop the deploy once something is left to the Safe.
+ * Empty once `proposeStagedSafeBatches` has handled them.
+ */
+export async function stagedFilesThisRun(hre: HardhatDeployRuntime): Promise<string[]> {
+  const run = await runs.get(hre)?.catch(() => undefined);
+  await run?.steps;
+  return run ? [...run.files.values()] : [];
 }
 
 /** Deletes a staged file, e.g. one that should never be proposed. */
@@ -441,13 +517,9 @@ export interface TaskDefinition {
   setAction(action: (args: TaskArgs, hre: HardhatDeployRuntime) => Promise<unknown>): TaskDefinition;
 }
 
-export interface SafeTasksOptions {
+export interface SafeTasksOptions extends SafeServiceOptions {
   /** The proposer for `safe:propose`. Defaults to Hardhat's `deployer` account. */
   signer?: (hre: HardhatDeployRuntime) => ProposalSigner | Promise<ProposalSigner>;
-  /** Defaults to the `SAFE_API_KEY` environment variable. */
-  apiKey?: string;
-  /** The Safe Transaction Service to use instead of Safe's own for the chain. */
-  txServiceUrl?: string;
 }
 
 /**
@@ -458,9 +530,9 @@ export function registerSafeTasks(
   task: (name: string, description?: string) => TaskDefinition,
   options: SafeTasksOptions = {},
 ): void {
-  const serviceOptions = (): TxServiceOptions => {
-    const apiKey = options.apiKey ?? process.env.SAFE_API_KEY;
-    return { ...(apiKey ? { apiKey } : {}), ...(options.txServiceUrl ? { txServiceUrl: options.txServiceUrl } : {}) };
+  const serviceOptions: SafeServiceOptions = {
+    ...(options.apiKey ? { apiKey: options.apiKey } : {}),
+    ...(options.txServiceUrl ? { txServiceUrl: options.txServiceUrl } : {}),
   };
 
   task("safe:list", "List staged Safe batches and, on a live network, what safe:propose would do with each")
@@ -470,7 +542,7 @@ export function registerSafeTasks(
       // Status needs the Safe service of the files' own chain: only the live network itself.
       const live = staged.length > 0 && (args.from ?? hre.network.name) === hre.network.name && !(await isLocal(hre));
       const chainId = live ? await publicClientFor(hre.network.provider).getChainId() : undefined;
-      const service = chainId === undefined ? undefined : await resolveTxService(chainId, serviceOptions());
+      const service = chainId === undefined ? undefined : await serviceFor(chainId, serviceOptions);
       printFolder(stagedDir(hre, args.from), staged.length);
       for (const { file, batch } of staged) {
         const lines = service ? await predict(hre.network.provider, service, batch) : [];
@@ -507,7 +579,7 @@ export function registerSafeTasks(
         files: args.file ? [args.file] : await listStagedFiles(hre),
         ...(args.yes ? { yes: true } : {}),
         ...(options.signer ? { signer: await options.signer(hre) } : {}),
-        ...serviceOptions(),
+        ...serviceOptions,
       });
     });
 
